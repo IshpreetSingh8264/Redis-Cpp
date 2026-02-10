@@ -146,6 +146,30 @@ int64_t getCurrentTimeMs() {
     ).count();
 }
 
+// ============================================================================
+// BLOCKING COMMANDS QUEUE
+// Blocking commands di queue - BLPOP/BRPOP waste
+// (Queue for blocking commands - used for BLPOP/BRPOP)
+// ============================================================================
+
+struct BlockingClient {
+    int clientFd;                           // Client da file descriptor
+    std::vector<std::string> keys;          // Kithe keys da wait hai
+    bool isLeft;                            // BLPOP = true, BRPOP = false
+    int64_t timeoutMs;                      // Timeout in milliseconds (-1 = infinite)
+    int64_t startTimeMs;                    // Kado start kita
+    
+    bool isTimedOut() const {
+        if (timeoutMs < 0) return false;    // No timeout = never expire
+        return (getCurrentTimeMs() - startTimeMs) >= timeoutMs;
+    }
+};
+
+// Queue of clients waiting for list data
+// Clients jo list da data wait kar rahe ne
+std::vector<BlockingClient> gBlockingClients;
+std::mutex gBlockingMutex;
+
 // Convert string to uppercase
 // String nu uppercase karo - CHOTE AKSHAR TO WADDE AKSHAR
 // (Convert string to uppercase - small to capital letters)
@@ -296,6 +320,92 @@ std::string respArray(const std::vector<std::string>& items) {
         result += item;
     }
     return result;
+}
+
+// ============================================================================
+// BLOCKING CLIENT NOTIFICATION
+// Blocked clients nu notify karo jado data aajaye
+// (Notify blocked clients when data arrives)
+// ============================================================================
+
+// Check and unblock waiting clients for a key
+// Ek key lai wait kar rahe clients nu check karo
+// Returns: number of clients unblocked
+// (Check clients waiting for a key - returns count of unblocked clients)
+int notifyBlockedClientsForKey(const std::string& key) {
+    std::lock_guard<std::mutex> blockLock(gBlockingMutex);
+    
+    for (auto it = gBlockingClients.begin(); it != gBlockingClients.end(); ) {
+        bool found = false;
+        for (const auto& waitKey : it->keys) {
+            if (waitKey == key) {
+                found = true;
+                break;
+            }
+        }
+        
+        if (found) {
+            // This client is waiting for this key - try to give them data!
+            // Is client nu data dena hai
+            std::unique_lock dataLock(gDataMutex);
+            auto dataIt = gData.find(key);
+            
+            if (dataIt != gData.end() && dataIt->second.type == DataType::LIST && 
+                !dataIt->second.listValue.empty()) {
+                
+                // Pop the value
+                std::string value;
+                if (it->isLeft) {
+                    value = dataIt->second.listValue.front();
+                    dataIt->second.listValue.pop_front();
+                } else {
+                    value = dataIt->second.listValue.back();
+                    dataIt->second.listValue.pop_back();
+                }
+                
+                // Clean up empty list
+                if (dataIt->second.listValue.empty()) {
+                    gData.erase(dataIt);
+                }
+                
+                dataLock.unlock();
+                
+                // Build and send response
+                std::vector<std::string> resp;
+                resp.push_back(respBulkString(key));
+                resp.push_back(respBulkString(value));
+                std::string response = respArray(resp);
+                
+                write(it->clientFd, response.c_str(), response.length());
+                
+                // Remove from blocking queue
+                it = gBlockingClients.erase(it);
+                return 1;  // Only unblock one client per key per notification
+            }
+        } else {
+            ++it;
+        }
+    }
+    
+    return 0;
+}
+
+// Check for timed out blocking clients
+// Timeout ho gaye clients nu check karo
+void checkBlockedClientTimeouts() {
+    std::lock_guard<std::mutex> blockLock(gBlockingMutex);
+    
+    for (auto it = gBlockingClients.begin(); it != gBlockingClients.end(); ) {
+        if (it->isTimedOut()) {
+            // Timeout ho gaya - null array bhejo
+            // (Timed out - send null array)
+            std::string response = respNullArray();
+            write(it->clientFd, response.c_str(), response.length());
+            it = gBlockingClients.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 // Encode command as RESP array
@@ -706,21 +816,31 @@ std::string handleLPush(const std::vector<std::string>& args) {
         return respError("ERR wrong number of arguments for 'lpush' command");
     }
     
-    std::unique_lock lock(gDataMutex);
     const std::string& key = args[1];
-    checkAndDeleteExpired(key);
+    int64_t newLen;
     
-    auto& val = gData[key];
-    if (val.type != DataType::NONE && val.type != DataType::LIST) {
-        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    {
+        std::unique_lock lock(gDataMutex);
+        checkAndDeleteExpired(key);
+        
+        auto& val = gData[key];
+        if (val.type != DataType::NONE && val.type != DataType::LIST) {
+            return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+        }
+        
+        val.type = DataType::LIST;
+        for (size_t i = 2; i < args.size(); i++) {
+            val.listValue.push_front(args[i]);
+        }
+        
+        newLen = val.listValue.size();
     }
     
-    val.type = DataType::LIST;
-    for (size_t i = 2; i < args.size(); i++) {
-        val.listValue.push_front(args[i]);
-    }
+    // List mein data aaya - blocked clients nu check karo
+    // (Data added to list - check blocked clients)
+    notifyBlockedClientsForKey(key);
     
-    return respInteger(val.listValue.size());
+    return respInteger(newLen);
 }
 
 std::string handleRPush(const std::vector<std::string>& args) {
@@ -728,21 +848,31 @@ std::string handleRPush(const std::vector<std::string>& args) {
         return respError("ERR wrong number of arguments for 'rpush' command");
     }
     
-    std::unique_lock lock(gDataMutex);
     const std::string& key = args[1];
-    checkAndDeleteExpired(key);
+    int64_t newLen;
     
-    auto& val = gData[key];
-    if (val.type != DataType::NONE && val.type != DataType::LIST) {
-        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    {
+        std::unique_lock lock(gDataMutex);
+        checkAndDeleteExpired(key);
+        
+        auto& val = gData[key];
+        if (val.type != DataType::NONE && val.type != DataType::LIST) {
+            return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+        }
+        
+        val.type = DataType::LIST;
+        for (size_t i = 2; i < args.size(); i++) {
+            val.listValue.push_back(args[i]);
+        }
+        
+        newLen = val.listValue.size();
     }
     
-    val.type = DataType::LIST;
-    for (size_t i = 2; i < args.size(); i++) {
-        val.listValue.push_back(args[i]);
-    }
+    // List mein data aaya - blocked clients nu check karo
+    // (Data added to list - check blocked clients)
+    notifyBlockedClientsForKey(key);
     
-    return respInteger(val.listValue.size());
+    return respInteger(newLen);
 }
 
 std::string handleLRange(const std::vector<std::string>& args) {
@@ -944,6 +1074,10 @@ std::string handleRPop(const std::vector<std::string>& args) {
 // Blocking list pop - wait karo jab tak list mein kuch na aaye
 // (Blocking list pop - wait until list has something)
 std::string handleBLPop(const std::vector<std::string>& args, int clientFd) {
+    // BLPOP - Blocking left pop
+    // List di left side se data lena, agar nahi hai toh wait karna
+    // (Get data from left side of list, wait if not available)
+    
     if (args.size() < 3) {
         return respError("ERR wrong number of arguments for 'blpop' command");
     }
@@ -959,49 +1093,54 @@ std::string handleBLPop(const std::vector<std::string>& args, int clientFd) {
         keys.push_back(args[i]);
     }
     
-    auto startTime = std::chrono::steady_clock::now();
-    int64_t timeoutMs = (timeout == 0) ? INT64_MAX : static_cast<int64_t>(timeout * 1000);
-    
-    while (true) {
-        {
-            std::unique_lock lock(gDataMutex);
-            
-            for (const auto& key : keys) {
-                auto it = gData.find(key);
-                if (it != gData.end() && it->second.type == DataType::LIST && !it->second.listValue.empty()) {
-                    // List mili with data - pop karo
-                    // (Found list with data - pop it)
-                    std::string value = it->second.listValue.front();
-                    it->second.listValue.pop_front();
-                    
-                    if (it->second.listValue.empty()) {
-                        gData.erase(it);
-                    }
-                    
-                    std::vector<std::string> result;
-                    result.push_back(respBulkString(key));
-                    result.push_back(respBulkString(value));
-                    return respArray(result);
+    // First check if any key already has data
+    // Pehle check karo ki kisi key mein data hai ki nahi
+    {
+        std::unique_lock lock(gDataMutex);
+        
+        for (const auto& key : keys) {
+            auto it = gData.find(key);
+            if (it != gData.end() && it->second.type == DataType::LIST && !it->second.listValue.empty()) {
+                // List mili with data - pop karo!
+                // (Found list with data - pop it!)
+                std::string value = it->second.listValue.front();
+                it->second.listValue.pop_front();
+                
+                if (it->second.listValue.empty()) {
+                    gData.erase(it);
                 }
+                
+                std::vector<std::string> result;
+                result.push_back(respBulkString(key));
+                result.push_back(respBulkString(value));
+                return respArray(result);
             }
         }
-        
-        // Check timeout
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - startTime
-        ).count();
-        
-        if (elapsed >= timeoutMs) {
-            return respNullArray();
-        }
-        
-        // Wait thoda
-        // (Wait a bit)
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
+    
+    // No data available - register for blocking
+    // Data nahi hai - wait queue mein register karo
+    // (No data available - register in wait queue)
+    {
+        std::lock_guard<std::mutex> blockLock(gBlockingMutex);
+        
+        BlockingClient bc;
+        bc.clientFd = clientFd;
+        bc.keys = keys;
+        bc.isLeft = true;  // BLPOP = left
+        bc.startTimeMs = getCurrentTimeMs();
+        bc.timeoutMs = (timeout == 0) ? -1 : static_cast<int64_t>(timeout * 1000);
+        
+        gBlockingClients.push_back(bc);
+    }
+    
+    // Return empty - response will be sent later
+    // Khali return - response baad mein jayega
+    return "";
 }
 
 // BRPOP - same as BLPOP but from right
+// BRPOP - BLPOP jaise hi, par right side se
 std::string handleBRPop(const std::vector<std::string>& args, int clientFd) {
     if (args.size() < 3) {
         return respError("ERR wrong number of arguments for 'brpop' command");
@@ -1014,41 +1153,43 @@ std::string handleBRPop(const std::vector<std::string>& args, int clientFd) {
         keys.push_back(args[i]);
     }
     
-    auto startTime = std::chrono::steady_clock::now();
-    int64_t timeoutMs = (timeout == 0) ? INT64_MAX : static_cast<int64_t>(timeout * 1000);
-    
-    while (true) {
-        {
-            std::unique_lock lock(gDataMutex);
-            
-            for (const auto& key : keys) {
-                auto it = gData.find(key);
-                if (it != gData.end() && it->second.type == DataType::LIST && !it->second.listValue.empty()) {
-                    std::string value = it->second.listValue.back();
-                    it->second.listValue.pop_back();
-                    
-                    if (it->second.listValue.empty()) {
-                        gData.erase(it);
-                    }
-                    
-                    std::vector<std::string> result;
-                    result.push_back(respBulkString(key));
-                    result.push_back(respBulkString(value));
-                    return respArray(result);
+    // First check if any key already has data
+    {
+        std::unique_lock lock(gDataMutex);
+        
+        for (const auto& key : keys) {
+            auto it = gData.find(key);
+            if (it != gData.end() && it->second.type == DataType::LIST && !it->second.listValue.empty()) {
+                std::string value = it->second.listValue.back();
+                it->second.listValue.pop_back();
+                
+                if (it->second.listValue.empty()) {
+                    gData.erase(it);
                 }
+                
+                std::vector<std::string> result;
+                result.push_back(respBulkString(key));
+                result.push_back(respBulkString(value));
+                return respArray(result);
             }
         }
-        
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - startTime
-        ).count();
-        
-        if (elapsed >= timeoutMs) {
-            return respNullArray();
-        }
-        
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
+    
+    // No data - register for blocking
+    {
+        std::lock_guard<std::mutex> blockLock(gBlockingMutex);
+        
+        BlockingClient bc;
+        bc.clientFd = clientFd;
+        bc.keys = keys;
+        bc.isLeft = false;  // BRPOP = right
+        bc.startTimeMs = getCurrentTimeMs();
+        bc.timeoutMs = (timeout == 0) ? -1 : static_cast<int64_t>(timeout * 1000);
+        
+        gBlockingClients.push_back(bc);
+    }
+    
+    return "";
 }
 
 // ============================================================================
@@ -2325,6 +2466,10 @@ int main(int argc, char **argv) {
     while (true) {
         int nfds = epoll_wait(epoll_fd, events, 64, 100);
         
+        // Check for timed out blocking clients
+        // Blocking clients nu timeout check karo
+        checkBlockedClientTimeouts();
+        
         for (int i = 0; i < nfds; i++) {
             int fd = events[i].data.fd;
             
@@ -2352,6 +2497,18 @@ int main(int argc, char **argv) {
                     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
                     close(fd);
                     clientBuffers.erase(fd);
+                    
+                    // Remove from blocking clients list if present
+                    // Blocking list se bhi remove karo
+                    {
+                        std::lock_guard<std::mutex> blockLock(gBlockingMutex);
+                        gBlockingClients.erase(
+                            std::remove_if(gBlockingClients.begin(), gBlockingClients.end(),
+                                [fd](const BlockingClient& bc) { return bc.clientFd == fd; }),
+                            gBlockingClients.end()
+                        );
+                    }
+                    
                     continue;
                 }
                 
