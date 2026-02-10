@@ -798,6 +798,48 @@ std::string handleLLen(const std::vector<std::string>& args) {
     return respInteger(it->second.listValue.size());
 }
 
+std::string handleLPop(const std::vector<std::string>& args) {
+    // LPOP - list de shuru ton element kaddo
+    // (LPOP - remove element from the beginning of list)
+    if (args.size() < 2) {
+        return respError("ERR wrong number of arguments for 'lpop' command");
+    }
+    
+    std::unique_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    checkAndDeleteExpired(key);
+    
+    auto it = gData.find(key);
+    if (it == gData.end()) {
+        // List nahi mili - null return karo
+        // (List not found - return null)
+        return respNull();
+    }
+    
+    if (it->second.type != DataType::LIST) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    if (it->second.listValue.empty()) {
+        // List khali hai - null return karo
+        // (List is empty - return null)
+        return respNull();
+    }
+    
+    // Pehla element lo te hata do
+    // (Get first element and remove it)
+    std::string value = it->second.listValue.front();
+    it->second.listValue.pop_front();
+    
+    // Agar list khali ho gayi, key hata do
+    // (If list became empty, remove the key)
+    if (it->second.listValue.empty()) {
+        gData.erase(it);
+    }
+    
+    return respBulkString(value);
+}
+
 // Stream commands
 std::string handleXAdd(const std::vector<std::string>& args) {
     if (args.size() < 5) {
@@ -1146,6 +1188,7 @@ std::string handleCommand(const std::vector<std::string>& args, int clientFd) {
     if (cmd == "RPUSH") return handleRPush(args);
     if (cmd == "LRANGE") return handleLRange(args);
     if (cmd == "LLEN") return handleLLen(args);
+    if (cmd == "LPOP") return handleLPop(args);
     if (cmd == "XADD") return handleXAdd(args);
     if (cmd == "XRANGE") return handleXRange(args);
     if (cmd == "XREAD") return handleXRead(args);
