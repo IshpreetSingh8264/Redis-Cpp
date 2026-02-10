@@ -170,6 +170,29 @@ struct BlockingClient {
 std::vector<BlockingClient> gBlockingClients;
 std::mutex gBlockingMutex;
 
+// ============================================================================
+// BLOCKING STREAM READS
+// Stream reads lai blocking queue - XREAD BLOCK waste
+// (Blocking queue for stream reads - used for XREAD BLOCK)
+// ============================================================================
+
+struct BlockingStreamClient {
+    int clientFd;                           // Client da file descriptor
+    std::vector<std::string> streamKeys;    // Kithe streams da wait hai
+    std::vector<std::string> lastIds;       // Last seen IDs for each stream
+    int64_t count;                          // Max entries to return (-1 = unlimited)
+    int64_t timeoutMs;                      // Timeout in milliseconds (-1 = infinite)
+    int64_t startTimeMs;                    // Kado start kita
+    
+    bool isTimedOut() const {
+        if (timeoutMs < 0) return false;
+        return (getCurrentTimeMs() - startTimeMs) >= timeoutMs;
+    }
+};
+
+std::vector<BlockingStreamClient> gBlockingStreamClients;
+std::mutex gBlockingStreamMutex;
+
 // Convert string to uppercase
 // String nu uppercase karo - CHOTE AKSHAR TO WADDE AKSHAR
 // (Convert string to uppercase - small to capital letters)
@@ -405,6 +428,100 @@ void checkBlockedClientTimeouts() {
         } else {
             ++it;
         }
+    }
+}
+
+// Check for timed out blocking stream clients
+// Stream read timeouts nu check karo
+void checkBlockedStreamClientTimeouts() {
+    std::lock_guard<std::mutex> lock(gBlockingStreamMutex);
+    
+    for (auto it = gBlockingStreamClients.begin(); it != gBlockingStreamClients.end(); ) {
+        if (it->isTimedOut()) {
+            std::string response = respNullArray();
+            write(it->clientFd, response.c_str(), response.length());
+            it = gBlockingStreamClients.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// Notify blocked stream clients when a new entry is added
+// Jado stream mein naya entry aave, blocked clients nu notify karo
+void notifyBlockedStreamClientsForKey(const std::string& key) {
+    std::lock_guard<std::mutex> streamLock(gBlockingStreamMutex);
+    
+    for (auto it = gBlockingStreamClients.begin(); it != gBlockingStreamClients.end(); ) {
+        bool found = false;
+        size_t keyIndex = 0;
+        
+        for (size_t i = 0; i < it->streamKeys.size(); i++) {
+            if (it->streamKeys[i] == key) {
+                found = true;
+                keyIndex = i;
+                break;
+            }
+        }
+        
+        if (found) {
+            // Check if there's new data after the lastId
+            std::shared_lock dataLock(gDataMutex);
+            auto dataIt = gData.find(key);
+            
+            if (dataIt != gData.end() && dataIt->second.type == DataType::STREAM) {
+                const std::string& lastId = it->lastIds[keyIndex];
+                std::vector<std::string> entries;
+                int64_t cnt = 0;
+                
+                for (const auto& entry : dataIt->second.streamValue) {
+                    // Compare IDs - entry should be > lastId
+                    auto dashPos1 = entry.id.find('-');
+                    auto dashPos2 = lastId.find('-');
+                    
+                    uint64_t ts1 = std::stoull(entry.id.substr(0, dashPos1));
+                    uint64_t seq1 = std::stoull(entry.id.substr(dashPos1 + 1));
+                    uint64_t ts2 = std::stoull(lastId.substr(0, dashPos2));
+                    uint64_t seq2 = std::stoull(lastId.substr(dashPos2 + 1));
+                    
+                    if (ts1 > ts2 || (ts1 == ts2 && seq1 > seq2)) {
+                        std::vector<std::string> entryArr;
+                        entryArr.push_back(respBulkString(entry.id));
+                        
+                        std::vector<std::string> fieldsArr;
+                        for (const auto& [field, value] : entry.fields) {
+                            fieldsArr.push_back(respBulkString(field));
+                            fieldsArr.push_back(respBulkString(value));
+                        }
+                        entryArr.push_back(respArray(fieldsArr));
+                        entries.push_back(respArray(entryArr));
+                        
+                        cnt++;
+                        if (it->count > 0 && cnt >= it->count) break;
+                    }
+                }
+                
+                if (!entries.empty()) {
+                    dataLock.unlock();
+                    
+                    // Build response
+                    std::vector<std::string> streamArr;
+                    streamArr.push_back(respBulkString(key));
+                    streamArr.push_back(respArray(entries));
+                    
+                    std::vector<std::string> resultArr;
+                    resultArr.push_back(respArray(streamArr));
+                    
+                    std::string response = respArray(resultArr);
+                    write(it->clientFd, response.c_str(), response.length());
+                    
+                    it = gBlockingStreamClients.erase(it);
+                    return;  // Only notify one client per entry
+                }
+            }
+        }
+        
+        ++it;
     }
 }
 
@@ -1941,75 +2058,84 @@ std::string handleXAdd(const std::vector<std::string>& args) {
         return respError("ERR wrong number of arguments for 'xadd' command");
     }
     
-    std::unique_lock lock(gDataMutex);
     const std::string& key = args[1];
     std::string id = args[2];
+    std::string resultId;
     
-    auto& val = gData[key];
-    if (val.type != DataType::NONE && val.type != DataType::STREAM) {
-        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
-    }
-    val.type = DataType::STREAM;
-    
-    uint64_t timestamp, sequence;
-    
-    if (id == "*") {
-        timestamp = getCurrentTimeMs();
-        if (timestamp == val.streamLastTimestamp) {
-            sequence = val.streamLastSequence + 1;
-        } else if (timestamp <= val.streamLastTimestamp) {
-            timestamp = val.streamLastTimestamp;
-            sequence = val.streamLastSequence + 1;
-        } else {
-            sequence = 0;
-        }
-    } else {
-        auto dashPos = id.find('-');
-        if (dashPos == std::string::npos) {
-            return respError("ERR Invalid stream ID specified as stream command argument");
-        }
+    {
+        std::unique_lock lock(gDataMutex);
         
-        std::string tsStr = id.substr(0, dashPos);
-        std::string seqStr = id.substr(dashPos + 1);
+        auto& val = gData[key];
+        if (val.type != DataType::NONE && val.type != DataType::STREAM) {
+            return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+        }
+        val.type = DataType::STREAM;
         
-        if (seqStr == "*") {
-            timestamp = std::stoull(tsStr);
+        uint64_t timestamp, sequence;
+        
+        if (id == "*") {
+            timestamp = getCurrentTimeMs();
             if (timestamp == val.streamLastTimestamp) {
                 sequence = val.streamLastSequence + 1;
-            } else if (timestamp > val.streamLastTimestamp) {
-                sequence = 0;
+            } else if (timestamp <= val.streamLastTimestamp) {
+                timestamp = val.streamLastTimestamp;
+                sequence = val.streamLastSequence + 1;
             } else {
-                return respError("ERR The ID specified in XADD is equal or smaller than the target stream top item");
+                sequence = 0;
             }
         } else {
-            timestamp = std::stoull(tsStr);
-            sequence = std::stoull(seqStr);
+            auto dashPos = id.find('-');
+            if (dashPos == std::string::npos) {
+                return respError("ERR Invalid stream ID specified as stream command argument");
+            }
+            
+            std::string tsStr = id.substr(0, dashPos);
+            std::string seqStr = id.substr(dashPos + 1);
+            
+            if (seqStr == "*") {
+                timestamp = std::stoull(tsStr);
+                if (timestamp == val.streamLastTimestamp) {
+                    sequence = val.streamLastSequence + 1;
+                } else if (timestamp > val.streamLastTimestamp) {
+                    sequence = 0;
+                } else {
+                    return respError("ERR The ID specified in XADD is equal or smaller than the target stream top item");
+                }
+            } else {
+                timestamp = std::stoull(tsStr);
+                sequence = std::stoull(seqStr);
+            }
+            
+            if (timestamp == 0 && sequence == 0) {
+                return respError("ERR The ID specified in XADD must be greater than 0-0");
+            }
+            
+            if (timestamp < val.streamLastTimestamp ||
+                (timestamp == val.streamLastTimestamp && sequence <= val.streamLastSequence)) {
+                return respError("ERR The ID specified in XADD is equal or smaller than the target stream top item");
+            }
         }
         
-        if (timestamp == 0 && sequence == 0) {
-            return respError("ERR The ID specified in XADD must be greater than 0-0");
+        StreamEntry entry;
+        entry.timestamp = timestamp;
+        entry.sequence = sequence;
+        entry.id = std::to_string(timestamp) + "-" + std::to_string(sequence);
+        resultId = entry.id;
+        
+        for (size_t i = 3; i + 1 < args.size(); i += 2) {
+            entry.fields.emplace_back(args[i], args[i + 1]);
         }
         
-        if (timestamp < val.streamLastTimestamp ||
-            (timestamp == val.streamLastTimestamp && sequence <= val.streamLastSequence)) {
-            return respError("ERR The ID specified in XADD is equal or smaller than the target stream top item");
-        }
+        val.streamValue.push_back(entry);
+        val.streamLastTimestamp = timestamp;
+        val.streamLastSequence = sequence;
     }
     
-    StreamEntry entry;
-    entry.timestamp = timestamp;
-    entry.sequence = sequence;
-    entry.id = std::to_string(timestamp) + "-" + std::to_string(sequence);
+    // Stream mein naya entry aaya - blocked clients nu notify karo
+    // (New entry added to stream - notify blocked clients)
+    notifyBlockedStreamClientsForKey(key);
     
-    for (size_t i = 3; i + 1 < args.size(); i += 2) {
-        entry.fields.emplace_back(args[i], args[i + 1]);
-    }
-    
-    val.streamValue.push_back(entry);
-    val.streamLastTimestamp = timestamp;
-    val.streamLastSequence = sequence;
-    
-    return respBulkString(entry.id);
+    return respBulkString(resultId);
 }
 
 std::string handleXRange(const std::vector<std::string>& args) {
@@ -2081,7 +2207,10 @@ std::string handleXRange(const std::vector<std::string>& args) {
     return respArray(result);
 }
 
-std::string handleXRead(const std::vector<std::string>& args) {
+std::string handleXRead(const std::vector<std::string>& args, int clientFd) {
+    // XREAD - Read from streams
+    // XREAD BLOCK ms STREAMS key [key ...] id [id ...]
+    
     // Parse XREAD args
     size_t streamsIdx = 0;
     int64_t blockMs = -1;
@@ -2112,7 +2241,25 @@ std::string handleXRead(const std::vector<std::string>& args) {
         ids.push_back(args[streamsIdx + numStreams + i]);
     }
     
-    auto readStreams = [&]() -> std::string {
+    // Resolve $ to actual last ID
+    // $ matlab newest - pehle resolve karo
+    {
+        std::shared_lock lock(gDataMutex);
+        for (size_t i = 0; i < keys.size(); i++) {
+            if (ids[i] == "$") {
+                auto it = gData.find(keys[i]);
+                if (it != gData.end() && it->second.type == DataType::STREAM && 
+                    !it->second.streamValue.empty()) {
+                    ids[i] = it->second.streamValue.back().id;
+                } else {
+                    ids[i] = "0-0";
+                }
+            }
+        }
+    }
+    
+    // Try to read immediately
+    auto tryRead = [&]() -> std::string {
         std::shared_lock lock(gDataMutex);
         std::vector<std::string> result;
         
@@ -2122,16 +2269,7 @@ std::string handleXRead(const std::vector<std::string>& args) {
                 continue;
             }
             
-            std::string startId = ids[i];
-            if (startId == "$") {
-                // Start from newest
-                if (it->second.streamValue.empty()) {
-                    startId = "0-0";
-                } else {
-                    startId = it->second.streamValue.back().id;
-                }
-            }
-            
+            const std::string& startId = ids[i];
             std::vector<std::string> entries;
             int64_t cnt = 0;
             
@@ -2176,26 +2314,35 @@ std::string handleXRead(const std::vector<std::string>& args) {
         return respArray(result);
     };
     
-    std::string response = readStreams();
+    std::string response = tryRead();
     if (!response.empty()) {
         return response;
     }
     
-    if (blockMs >= 0) {
-        // Blocking read
-        auto deadline = std::chrono::steady_clock::now() + 
-                        std::chrono::milliseconds(blockMs == 0 ? 100000000 : blockMs);
-        
-        while (std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            response = readStreams();
-            if (!response.empty()) {
-                return response;
-            }
-        }
+    // No data available
+    if (blockMs < 0) {
+        // Non-blocking - return null
+        return respNullArray();
     }
     
-    return respNullArray();
+    // Blocking - register in queue
+    // Blocking mode - queue mein register karo
+    {
+        std::lock_guard<std::mutex> lock(gBlockingStreamMutex);
+        
+        BlockingStreamClient bsc;
+        bsc.clientFd = clientFd;
+        bsc.streamKeys = keys;
+        bsc.lastIds = ids;
+        bsc.count = count;
+        bsc.startTimeMs = getCurrentTimeMs();
+        bsc.timeoutMs = (blockMs == 0) ? -1 : blockMs;  // 0 = infinite
+        
+        gBlockingStreamClients.push_back(bsc);
+    }
+    
+    // Return empty - response will be sent when data arrives
+    return "";
 }
 
 // Replication commands
@@ -2328,7 +2475,7 @@ std::string handleCommand(const std::vector<std::string>& args, int clientFd) {
     // Stream commands
     if (cmd == "XADD") return handleXAdd(args);
     if (cmd == "XRANGE") return handleXRange(args);
-    if (cmd == "XREAD") return handleXRead(args);
+    if (cmd == "XREAD") return handleXRead(args, clientFd);
     
     // Transaction commands
     if (cmd == "MULTI") return handleMulti(args, clientFd);
@@ -2469,6 +2616,7 @@ int main(int argc, char **argv) {
         // Check for timed out blocking clients
         // Blocking clients nu timeout check karo
         checkBlockedClientTimeouts();
+        checkBlockedStreamClientTimeouts();
         
         for (int i = 0; i < nfds; i++) {
             int fd = events[i].data.fd;
@@ -2506,6 +2654,17 @@ int main(int argc, char **argv) {
                             std::remove_if(gBlockingClients.begin(), gBlockingClients.end(),
                                 [fd](const BlockingClient& bc) { return bc.clientFd == fd; }),
                             gBlockingClients.end()
+                        );
+                    }
+                    
+                    // Remove from blocking stream clients too
+                    // Stream blocking list se bhi remove karo
+                    {
+                        std::lock_guard<std::mutex> streamLock(gBlockingStreamMutex);
+                        gBlockingStreamClients.erase(
+                            std::remove_if(gBlockingStreamClients.begin(), gBlockingStreamClients.end(),
+                                [fd](const BlockingStreamClient& bsc) { return bsc.clientFd == fd; }),
+                            gBlockingStreamClients.end()
                         );
                     }
                     
