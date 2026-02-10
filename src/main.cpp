@@ -59,6 +59,10 @@
 // Sab theek = All good
 // ============================================================================
 
+// Forward declarations
+// Pehle declare karo - baad mein define karenge
+std::string handleCommand(const std::vector<std::string>& args, int clientFd);
+
 // ============================================================================
 // CONFIGURATION
 // Server di settings - port, directories, etc.
@@ -809,6 +813,18 @@ std::string handleLPop(const std::vector<std::string>& args) {
     const std::string& key = args[1];
     checkAndDeleteExpired(key);
     
+    // Count parameter check karo - kitne elements kadhne ne
+    // (Check count parameter - how many elements to remove)
+    int64_t count = 1;
+    bool hasCount = false;
+    if (args.size() >= 3) {
+        count = std::stoll(args[2]);
+        hasCount = true;
+        if (count < 0) {
+            return respError("ERR value is out of range, must be positive");
+        }
+    }
+    
     auto it = gData.find(key);
     if (it == gData.end()) {
         // List nahi mili - null return karo
@@ -826,10 +842,30 @@ std::string handleLPop(const std::vector<std::string>& args) {
         return respNull();
     }
     
-    // Pehla element lo te hata do
-    // (Get first element and remove it)
-    std::string value = it->second.listValue.front();
-    it->second.listValue.pop_front();
+    // Agar count dita hai te array return karo, nahi te single element
+    // (If count is given, return array, otherwise single element)
+    if (!hasCount) {
+        // Single element kadho
+        // (Remove single element)
+        std::string value = it->second.listValue.front();
+        it->second.listValue.pop_front();
+        
+        if (it->second.listValue.empty()) {
+            gData.erase(it);
+        }
+        
+        return respBulkString(value);
+    }
+    
+    // Multiple elements kadho
+    // (Remove multiple elements)
+    std::vector<std::string> result;
+    int64_t actualCount = std::min(count, static_cast<int64_t>(it->second.listValue.size()));
+    
+    for (int64_t i = 0; i < actualCount; i++) {
+        result.push_back(respBulkString(it->second.listValue.front()));
+        it->second.listValue.pop_front();
+    }
     
     // Agar list khali ho gayi, key hata do
     // (If list became empty, remove the key)
@@ -837,7 +873,925 @@ std::string handleLPop(const std::vector<std::string>& args) {
         gData.erase(it);
     }
     
-    return respBulkString(value);
+    return respArray(result);
+}
+
+std::string handleRPop(const std::vector<std::string>& args) {
+    // RPOP - list de end ton element kaddo
+    // (RPOP - remove element from the end of list)
+    if (args.size() < 2) {
+        return respError("ERR wrong number of arguments for 'rpop' command");
+    }
+    
+    std::unique_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    checkAndDeleteExpired(key);
+    
+    // Count parameter check karo
+    // (Check count parameter)
+    int64_t count = 1;
+    bool hasCount = false;
+    if (args.size() >= 3) {
+        count = std::stoll(args[2]);
+        hasCount = true;
+        if (count < 0) {
+            return respError("ERR value is out of range, must be positive");
+        }
+    }
+    
+    auto it = gData.find(key);
+    if (it == gData.end()) {
+        return respNull();
+    }
+    
+    if (it->second.type != DataType::LIST) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    if (it->second.listValue.empty()) {
+        return respNull();
+    }
+    
+    if (!hasCount) {
+        // Single element
+        std::string value = it->second.listValue.back();
+        it->second.listValue.pop_back();
+        
+        if (it->second.listValue.empty()) {
+            gData.erase(it);
+        }
+        
+        return respBulkString(value);
+    }
+    
+    // Multiple elements
+    std::vector<std::string> result;
+    int64_t actualCount = std::min(count, static_cast<int64_t>(it->second.listValue.size()));
+    
+    for (int64_t i = 0; i < actualCount; i++) {
+        result.push_back(respBulkString(it->second.listValue.back()));
+        it->second.listValue.pop_back();
+    }
+    
+    if (it->second.listValue.empty()) {
+        gData.erase(it);
+    }
+    
+    return respArray(result);
+}
+
+// BLPOP - Blocking LPOP
+// Blocking list pop - wait karo jab tak list mein kuch na aaye
+// (Blocking list pop - wait until list has something)
+std::string handleBLPop(const std::vector<std::string>& args, int clientFd) {
+    if (args.size() < 3) {
+        return respError("ERR wrong number of arguments for 'blpop' command");
+    }
+    
+    // Last argument is timeout
+    // Akhri argument timeout hai
+    double timeout = std::stod(args[args.size() - 1]);
+    
+    // Keys are args[1] to args[size-2]
+    // Keys hain args[1] se args[size-2] tak
+    std::vector<std::string> keys;
+    for (size_t i = 1; i < args.size() - 1; i++) {
+        keys.push_back(args[i]);
+    }
+    
+    auto startTime = std::chrono::steady_clock::now();
+    int64_t timeoutMs = (timeout == 0) ? INT64_MAX : static_cast<int64_t>(timeout * 1000);
+    
+    while (true) {
+        {
+            std::unique_lock lock(gDataMutex);
+            
+            for (const auto& key : keys) {
+                auto it = gData.find(key);
+                if (it != gData.end() && it->second.type == DataType::LIST && !it->second.listValue.empty()) {
+                    // List mili with data - pop karo
+                    // (Found list with data - pop it)
+                    std::string value = it->second.listValue.front();
+                    it->second.listValue.pop_front();
+                    
+                    if (it->second.listValue.empty()) {
+                        gData.erase(it);
+                    }
+                    
+                    std::vector<std::string> result;
+                    result.push_back(respBulkString(key));
+                    result.push_back(respBulkString(value));
+                    return respArray(result);
+                }
+            }
+        }
+        
+        // Check timeout
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - startTime
+        ).count();
+        
+        if (elapsed >= timeoutMs) {
+            return respNullArray();
+        }
+        
+        // Wait thoda
+        // (Wait a bit)
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
+// BRPOP - same as BLPOP but from right
+std::string handleBRPop(const std::vector<std::string>& args, int clientFd) {
+    if (args.size() < 3) {
+        return respError("ERR wrong number of arguments for 'brpop' command");
+    }
+    
+    double timeout = std::stod(args[args.size() - 1]);
+    
+    std::vector<std::string> keys;
+    for (size_t i = 1; i < args.size() - 1; i++) {
+        keys.push_back(args[i]);
+    }
+    
+    auto startTime = std::chrono::steady_clock::now();
+    int64_t timeoutMs = (timeout == 0) ? INT64_MAX : static_cast<int64_t>(timeout * 1000);
+    
+    while (true) {
+        {
+            std::unique_lock lock(gDataMutex);
+            
+            for (const auto& key : keys) {
+                auto it = gData.find(key);
+                if (it != gData.end() && it->second.type == DataType::LIST && !it->second.listValue.empty()) {
+                    std::string value = it->second.listValue.back();
+                    it->second.listValue.pop_back();
+                    
+                    if (it->second.listValue.empty()) {
+                        gData.erase(it);
+                    }
+                    
+                    std::vector<std::string> result;
+                    result.push_back(respBulkString(key));
+                    result.push_back(respBulkString(value));
+                    return respArray(result);
+                }
+            }
+        }
+        
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - startTime
+        ).count();
+        
+        if (elapsed >= timeoutMs) {
+            return respNullArray();
+        }
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
+// ============================================================================
+// TRANSACTION COMMANDS
+// Transactions - MULTI/EXEC/DISCARD
+// ============================================================================
+
+// Per-client transaction state
+// Har client di apni transaction state
+std::map<int, bool> gClientInMulti;
+std::map<int, std::vector<std::vector<std::string>>> gClientQueues;
+
+std::string handleMulti(const std::vector<std::string>& args, int clientFd) {
+    // MULTI - transaction shuru karo
+    // (MULTI - start a transaction)
+    if (gClientInMulti[clientFd]) {
+        return respError("ERR MULTI calls can not be nested");
+    }
+    gClientInMulti[clientFd] = true;
+    gClientQueues[clientFd].clear();
+    return respSimpleString("OK");
+}
+
+std::string handleExec(const std::vector<std::string>& args, int clientFd) {
+    // EXEC - transaction execute karo
+    // (EXEC - execute the transaction)
+    if (!gClientInMulti[clientFd]) {
+        return respError("ERR EXEC without MULTI");
+    }
+    
+    gClientInMulti[clientFd] = false;
+    auto& queue = gClientQueues[clientFd];
+    
+    if (queue.empty()) {
+        return respArray({});
+    }
+    
+    std::vector<std::string> results;
+    for (auto& cmdArgs : queue) {
+        std::string result = handleCommand(cmdArgs, clientFd);
+        results.push_back(result);
+    }
+    
+    queue.clear();
+    return respArray(results);
+}
+
+std::string handleDiscard(const std::vector<std::string>& args, int clientFd) {
+    // DISCARD - transaction cancel karo
+    // (DISCARD - cancel the transaction)
+    if (!gClientInMulti[clientFd]) {
+        return respError("ERR DISCARD without MULTI");
+    }
+    
+    gClientInMulti[clientFd] = false;
+    gClientQueues[clientFd].clear();
+    return respSimpleString("OK");
+}
+
+// ============================================================================
+// DECR COMMAND
+// ============================================================================
+
+std::string handleDecr(const std::vector<std::string>& args) {
+    // DECR - value ghatao
+    // (DECR - decrease value)
+    if (args.size() < 2) {
+        return respError("ERR wrong number of arguments for 'decr' command");
+    }
+    
+    std::unique_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    checkAndDeleteExpired(key);
+    
+    auto it = gData.find(key);
+    int64_t val = 0;
+    
+    if (it != gData.end()) {
+        if (it->second.type != DataType::STRING) {
+            return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+        }
+        try {
+            val = std::stoll(it->second.stringValue);
+        } catch (...) {
+            return respError("ERR value is not an integer or out of range");
+        }
+    }
+    
+    val--;
+    gData[key].type = DataType::STRING;
+    gData[key].stringValue = std::to_string(val);
+    
+    return respInteger(val);
+}
+
+// ============================================================================
+// SET COMMANDS (SADD, SMEMBERS, SISMEMBER, SREM, SCARD)
+// ============================================================================
+
+std::string handleSAdd(const std::vector<std::string>& args) {
+    // SADD - set mein member add karo
+    // (SADD - add member to set)
+    if (args.size() < 3) {
+        return respError("ERR wrong number of arguments for 'sadd' command");
+    }
+    
+    std::unique_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    checkAndDeleteExpired(key);
+    
+    auto& val = gData[key];
+    if (val.type != DataType::NONE && val.type != DataType::SET) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    val.type = DataType::SET;
+    int64_t added = 0;
+    
+    for (size_t i = 2; i < args.size(); i++) {
+        auto result = val.setValue.insert(args[i]);
+        if (result.second) added++;
+    }
+    
+    return respInteger(added);
+}
+
+std::string handleSMembers(const std::vector<std::string>& args) {
+    // SMEMBERS - set de sab members lo
+    // (SMEMBERS - get all members of set)
+    if (args.size() < 2) {
+        return respError("ERR wrong number of arguments for 'smembers' command");
+    }
+    
+    std::shared_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    
+    auto it = gData.find(key);
+    if (it == gData.end() || it->second.isExpired()) {
+        return respArray({});
+    }
+    
+    if (it->second.type != DataType::SET) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    std::vector<std::string> result;
+    for (const auto& member : it->second.setValue) {
+        result.push_back(respBulkString(member));
+    }
+    
+    return respArray(result);
+}
+
+std::string handleSIsMember(const std::vector<std::string>& args) {
+    // SISMEMBER - check karo member set mein hai ki nahi
+    // (SISMEMBER - check if member exists in set)
+    if (args.size() < 3) {
+        return respError("ERR wrong number of arguments for 'sismember' command");
+    }
+    
+    std::shared_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    const std::string& member = args[2];
+    
+    auto it = gData.find(key);
+    if (it == gData.end() || it->second.isExpired()) {
+        return respInteger(0);
+    }
+    
+    if (it->second.type != DataType::SET) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    return respInteger(it->second.setValue.count(member) > 0 ? 1 : 0);
+}
+
+std::string handleSRem(const std::vector<std::string>& args) {
+    // SREM - set vichon member hata do
+    // (SREM - remove member from set)
+    if (args.size() < 3) {
+        return respError("ERR wrong number of arguments for 'srem' command");
+    }
+    
+    std::unique_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    
+    auto it = gData.find(key);
+    if (it == gData.end() || it->second.isExpired()) {
+        return respInteger(0);
+    }
+    
+    if (it->second.type != DataType::SET) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    int64_t removed = 0;
+    for (size_t i = 2; i < args.size(); i++) {
+        removed += it->second.setValue.erase(args[i]);
+    }
+    
+    if (it->second.setValue.empty()) {
+        gData.erase(it);
+    }
+    
+    return respInteger(removed);
+}
+
+std::string handleSCard(const std::vector<std::string>& args) {
+    // SCARD - set di size
+    // (SCARD - size of set)
+    if (args.size() < 2) {
+        return respError("ERR wrong number of arguments for 'scard' command");
+    }
+    
+    std::shared_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    
+    auto it = gData.find(key);
+    if (it == gData.end() || it->second.isExpired()) {
+        return respInteger(0);
+    }
+    
+    if (it->second.type != DataType::SET) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    return respInteger(it->second.setValue.size());
+}
+
+// ============================================================================
+// HASH COMMANDS (HSET, HGET, HGETALL, HDEL, HEXISTS, HLEN)
+// ============================================================================
+
+std::string handleHSet(const std::vector<std::string>& args) {
+    // HSET - hash mein field set karo
+    // (HSET - set field in hash)
+    if (args.size() < 4 || (args.size() - 2) % 2 != 0) {
+        return respError("ERR wrong number of arguments for 'hset' command");
+    }
+    
+    std::unique_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    checkAndDeleteExpired(key);
+    
+    auto& val = gData[key];
+    if (val.type != DataType::NONE && val.type != DataType::HASH) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    val.type = DataType::HASH;
+    int64_t added = 0;
+    
+    for (size_t i = 2; i + 1 < args.size(); i += 2) {
+        if (val.hashValue.find(args[i]) == val.hashValue.end()) {
+            added++;
+        }
+        val.hashValue[args[i]] = args[i + 1];
+    }
+    
+    return respInteger(added);
+}
+
+std::string handleHGet(const std::vector<std::string>& args) {
+    // HGET - hash vichon field lo
+    // (HGET - get field from hash)
+    if (args.size() < 3) {
+        return respError("ERR wrong number of arguments for 'hget' command");
+    }
+    
+    std::shared_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    const std::string& field = args[2];
+    
+    auto it = gData.find(key);
+    if (it == gData.end() || it->second.isExpired()) {
+        return respNull();
+    }
+    
+    if (it->second.type != DataType::HASH) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    auto fit = it->second.hashValue.find(field);
+    if (fit == it->second.hashValue.end()) {
+        return respNull();
+    }
+    
+    return respBulkString(fit->second);
+}
+
+std::string handleHGetAll(const std::vector<std::string>& args) {
+    // HGETALL - hash de sab fields te values
+    // (HGETALL - get all fields and values from hash)
+    if (args.size() < 2) {
+        return respError("ERR wrong number of arguments for 'hgetall' command");
+    }
+    
+    std::shared_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    
+    auto it = gData.find(key);
+    if (it == gData.end() || it->second.isExpired()) {
+        return respArray({});
+    }
+    
+    if (it->second.type != DataType::HASH) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    std::vector<std::string> result;
+    for (const auto& [field, value] : it->second.hashValue) {
+        result.push_back(respBulkString(field));
+        result.push_back(respBulkString(value));
+    }
+    
+    return respArray(result);
+}
+
+std::string handleHDel(const std::vector<std::string>& args) {
+    // HDEL - hash vichon field hata do
+    // (HDEL - delete field from hash)
+    if (args.size() < 3) {
+        return respError("ERR wrong number of arguments for 'hdel' command");
+    }
+    
+    std::unique_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    
+    auto it = gData.find(key);
+    if (it == gData.end() || it->second.isExpired()) {
+        return respInteger(0);
+    }
+    
+    if (it->second.type != DataType::HASH) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    int64_t removed = 0;
+    for (size_t i = 2; i < args.size(); i++) {
+        removed += it->second.hashValue.erase(args[i]);
+    }
+    
+    if (it->second.hashValue.empty()) {
+        gData.erase(it);
+    }
+    
+    return respInteger(removed);
+}
+
+std::string handleHExists(const std::vector<std::string>& args) {
+    // HEXISTS - check karo field hash mein hai ki nahi
+    // (HEXISTS - check if field exists in hash)
+    if (args.size() < 3) {
+        return respError("ERR wrong number of arguments for 'hexists' command");
+    }
+    
+    std::shared_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    const std::string& field = args[2];
+    
+    auto it = gData.find(key);
+    if (it == gData.end() || it->second.isExpired()) {
+        return respInteger(0);
+    }
+    
+    if (it->second.type != DataType::HASH) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    return respInteger(it->second.hashValue.count(field) > 0 ? 1 : 0);
+}
+
+std::string handleHLen(const std::vector<std::string>& args) {
+    // HLEN - hash di size
+    // (HLEN - size of hash)
+    if (args.size() < 2) {
+        return respError("ERR wrong number of arguments for 'hlen' command");
+    }
+    
+    std::shared_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    
+    auto it = gData.find(key);
+    if (it == gData.end() || it->second.isExpired()) {
+        return respInteger(0);
+    }
+    
+    if (it->second.type != DataType::HASH) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    return respInteger(it->second.hashValue.size());
+}
+
+// ============================================================================
+// SORTED SET COMMANDS (ZADD, ZSCORE, ZRANK, ZRANGE, ZCOUNT, ZCARD, ZREM)
+// ============================================================================
+
+std::string handleZAdd(const std::vector<std::string>& args) {
+    // ZADD - sorted set mein member add karo with score
+    // (ZADD - add member to sorted set with score)
+    if (args.size() < 4 || (args.size() - 2) % 2 != 0) {
+        return respError("ERR wrong number of arguments for 'zadd' command");
+    }
+    
+    std::unique_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    checkAndDeleteExpired(key);
+    
+    auto& val = gData[key];
+    if (val.type != DataType::NONE && val.type != DataType::ZSET) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    val.type = DataType::ZSET;
+    int64_t added = 0;
+    
+    for (size_t i = 2; i + 1 < args.size(); i += 2) {
+        double score = std::stod(args[i]);
+        const std::string& member = args[i + 1];
+        
+        // Check agar member pehle se hai
+        auto it = val.zsetScores.find(member);
+        if (it != val.zsetScores.end()) {
+            // Remove old entry from sorted multimap
+            double oldScore = it->second;
+            auto range = val.zsetByScore.equal_range(oldScore);
+            for (auto sit = range.first; sit != range.second; ++sit) {
+                if (sit->second == member) {
+                    val.zsetByScore.erase(sit);
+                    break;
+                }
+            }
+        } else {
+            added++;
+        }
+        
+        val.zsetScores[member] = score;
+        val.zsetByScore.insert({score, member});
+    }
+    
+    return respInteger(added);
+}
+
+std::string handleZScore(const std::vector<std::string>& args) {
+    // ZSCORE - member da score lo
+    // (ZSCORE - get score of member)
+    if (args.size() < 3) {
+        return respError("ERR wrong number of arguments for 'zscore' command");
+    }
+    
+    std::shared_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    const std::string& member = args[2];
+    
+    auto it = gData.find(key);
+    if (it == gData.end() || it->second.isExpired()) {
+        return respNull();
+    }
+    
+    if (it->second.type != DataType::ZSET) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    auto sit = it->second.zsetScores.find(member);
+    if (sit == it->second.zsetScores.end()) {
+        return respNull();
+    }
+    
+    // Return score as bulk string
+    std::ostringstream oss;
+    oss << std::setprecision(17) << sit->second;
+    return respBulkString(oss.str());
+}
+
+std::string handleZRank(const std::vector<std::string>& args) {
+    // ZRANK - member da rank lo (0-based)
+    // (ZRANK - get rank of member, 0-based)
+    if (args.size() < 3) {
+        return respError("ERR wrong number of arguments for 'zrank' command");
+    }
+    
+    std::shared_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    const std::string& member = args[2];
+    
+    auto it = gData.find(key);
+    if (it == gData.end() || it->second.isExpired()) {
+        return respNull();
+    }
+    
+    if (it->second.type != DataType::ZSET) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    auto scoreIt = it->second.zsetScores.find(member);
+    if (scoreIt == it->second.zsetScores.end()) {
+        return respNull();
+    }
+    
+    // Count rank
+    int64_t rank = 0;
+    for (const auto& [score, mem] : it->second.zsetByScore) {
+        if (mem == member) {
+            return respInteger(rank);
+        }
+        rank++;
+    }
+    
+    return respNull();
+}
+
+std::string handleZRange(const std::vector<std::string>& args) {
+    // ZRANGE - sorted set de members by rank
+    // (ZRANGE - get members by rank range)
+    if (args.size() < 4) {
+        return respError("ERR wrong number of arguments for 'zrange' command");
+    }
+    
+    std::shared_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    int64_t start = std::stoll(args[2]);
+    int64_t stop = std::stoll(args[3]);
+    
+    bool withScores = false;
+    if (args.size() >= 5 && toUpper(args[4]) == "WITHSCORES") {
+        withScores = true;
+    }
+    
+    auto it = gData.find(key);
+    if (it == gData.end() || it->second.isExpired()) {
+        return respArray({});
+    }
+    
+    if (it->second.type != DataType::ZSET) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    int64_t len = it->second.zsetByScore.size();
+    
+    // Handle negative indexes
+    if (start < 0) start = len + start;
+    if (stop < 0) stop = len + stop;
+    if (start < 0) start = 0;
+    if (stop >= len) stop = len - 1;
+    
+    std::vector<std::string> result;
+    int64_t idx = 0;
+    
+    for (const auto& [score, member] : it->second.zsetByScore) {
+        if (idx >= start && idx <= stop) {
+            result.push_back(respBulkString(member));
+            if (withScores) {
+                std::ostringstream oss;
+                oss << std::setprecision(17) << score;
+                result.push_back(respBulkString(oss.str()));
+            }
+        }
+        idx++;
+        if (idx > stop) break;
+    }
+    
+    return respArray(result);
+}
+
+std::string handleZCount(const std::vector<std::string>& args) {
+    // ZCOUNT - count members in score range
+    // (ZCOUNT - score range mein kitne members)
+    if (args.size() < 4) {
+        return respError("ERR wrong number of arguments for 'zcount' command");
+    }
+    
+    std::shared_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    
+    auto it = gData.find(key);
+    if (it == gData.end() || it->second.isExpired()) {
+        return respInteger(0);
+    }
+    
+    if (it->second.type != DataType::ZSET) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    // Parse min/max (handle -inf, +inf, (exclusive)
+    double minScore, maxScore;
+    bool minExclusive = false, maxExclusive = false;
+    
+    std::string minStr = args[2];
+    std::string maxStr = args[3];
+    
+    if (minStr[0] == '(') {
+        minExclusive = true;
+        minStr = minStr.substr(1);
+    }
+    if (maxStr[0] == '(') {
+        maxExclusive = true;
+        maxStr = maxStr.substr(1);
+    }
+    
+    if (minStr == "-inf") {
+        minScore = -std::numeric_limits<double>::infinity();
+    } else if (minStr == "+inf") {
+        minScore = std::numeric_limits<double>::infinity();
+    } else {
+        minScore = std::stod(minStr);
+    }
+    
+    if (maxStr == "-inf") {
+        maxScore = -std::numeric_limits<double>::infinity();
+    } else if (maxStr == "+inf") {
+        maxScore = std::numeric_limits<double>::infinity();
+    } else {
+        maxScore = std::stod(maxStr);
+    }
+    
+    int64_t count = 0;
+    for (const auto& [score, member] : it->second.zsetByScore) {
+        bool inRange = true;
+        if (minExclusive) {
+            inRange = inRange && (score > minScore);
+        } else {
+            inRange = inRange && (score >= minScore);
+        }
+        if (maxExclusive) {
+            inRange = inRange && (score < maxScore);
+        } else {
+            inRange = inRange && (score <= maxScore);
+        }
+        if (inRange) count++;
+    }
+    
+    return respInteger(count);
+}
+
+std::string handleZCard(const std::vector<std::string>& args) {
+    // ZCARD - sorted set di size
+    // (ZCARD - size of sorted set)
+    if (args.size() < 2) {
+        return respError("ERR wrong number of arguments for 'zcard' command");
+    }
+    
+    std::shared_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    
+    auto it = gData.find(key);
+    if (it == gData.end() || it->second.isExpired()) {
+        return respInteger(0);
+    }
+    
+    if (it->second.type != DataType::ZSET) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    return respInteger(it->second.zsetScores.size());
+}
+
+std::string handleZRem(const std::vector<std::string>& args) {
+    // ZREM - sorted set vichon member hata do
+    // (ZREM - remove member from sorted set)
+    if (args.size() < 3) {
+        return respError("ERR wrong number of arguments for 'zrem' command");
+    }
+    
+    std::unique_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    
+    auto it = gData.find(key);
+    if (it == gData.end() || it->second.isExpired()) {
+        return respInteger(0);
+    }
+    
+    if (it->second.type != DataType::ZSET) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    int64_t removed = 0;
+    for (size_t i = 2; i < args.size(); i++) {
+        const std::string& member = args[i];
+        auto scoreIt = it->second.zsetScores.find(member);
+        if (scoreIt != it->second.zsetScores.end()) {
+            double score = scoreIt->second;
+            
+            // Remove from multimap
+            auto range = it->second.zsetByScore.equal_range(score);
+            for (auto sit = range.first; sit != range.second; ++sit) {
+                if (sit->second == member) {
+                    it->second.zsetByScore.erase(sit);
+                    break;
+                }
+            }
+            
+            it->second.zsetScores.erase(scoreIt);
+            removed++;
+        }
+    }
+    
+    if (it->second.zsetScores.empty()) {
+        gData.erase(it);
+    }
+    
+    return respInteger(removed);
+}
+
+// ============================================================================
+// DEL AND EXISTS COMMANDS
+// ============================================================================
+
+std::string handleDel(const std::vector<std::string>& args) {
+    // DEL - keys hata do
+    // (DEL - delete keys)
+    if (args.size() < 2) {
+        return respError("ERR wrong number of arguments for 'del' command");
+    }
+    
+    std::unique_lock lock(gDataMutex);
+    int64_t deleted = 0;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        deleted += gData.erase(args[i]);
+    }
+    
+    return respInteger(deleted);
+}
+
+std::string handleExists(const std::vector<std::string>& args) {
+    // EXISTS - check karo key hai ki nahi
+    // (EXISTS - check if key exists)
+    if (args.size() < 2) {
+        return respError("ERR wrong number of arguments for 'exists' command");
+    }
+    
+    std::shared_lock lock(gDataMutex);
+    int64_t count = 0;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        auto it = gData.find(args[i]);
+        if (it != gData.end() && !it->second.isExpired()) {
+            count++;
+        }
+    }
+    
+    return respInteger(count);
 }
 
 // Stream commands
@@ -1175,23 +2129,72 @@ std::string handleCommand(const std::vector<std::string>& args, int clientFd) {
     
     std::string cmd = toUpper(args[0]);
     
+    // Check if in MULTI mode - queue commands instead of executing
+    // Agar MULTI mode mein hai te commands queue karo
+    if (gClientInMulti[clientFd] && cmd != "EXEC" && cmd != "DISCARD" && cmd != "MULTI") {
+        gClientQueues[clientFd].push_back(args);
+        return respSimpleString("QUEUED");
+    }
+    
+    // String commands
     if (cmd == "PING") return handlePing(args);
     if (cmd == "ECHO") return handleEcho(args);
     if (cmd == "SET") return handleSet(args);
     if (cmd == "GET") return handleGet(args);
     if (cmd == "INCR") return handleIncr(args);
+    if (cmd == "DECR") return handleDecr(args);
+    if (cmd == "DEL") return handleDel(args);
+    if (cmd == "EXISTS") return handleExists(args);
     if (cmd == "TYPE") return handleType(args);
     if (cmd == "KEYS") return handleKeys(args);
     if (cmd == "CONFIG") return handleConfig(args);
     if (cmd == "INFO") return handleInfo(args);
+    
+    // List commands
     if (cmd == "LPUSH") return handleLPush(args);
     if (cmd == "RPUSH") return handleRPush(args);
     if (cmd == "LRANGE") return handleLRange(args);
     if (cmd == "LLEN") return handleLLen(args);
     if (cmd == "LPOP") return handleLPop(args);
+    if (cmd == "RPOP") return handleRPop(args);
+    if (cmd == "BLPOP") return handleBLPop(args, clientFd);
+    if (cmd == "BRPOP") return handleBRPop(args, clientFd);
+    
+    // Set commands
+    if (cmd == "SADD") return handleSAdd(args);
+    if (cmd == "SMEMBERS") return handleSMembers(args);
+    if (cmd == "SISMEMBER") return handleSIsMember(args);
+    if (cmd == "SREM") return handleSRem(args);
+    if (cmd == "SCARD") return handleSCard(args);
+    
+    // Hash commands
+    if (cmd == "HSET") return handleHSet(args);
+    if (cmd == "HGET") return handleHGet(args);
+    if (cmd == "HGETALL") return handleHGetAll(args);
+    if (cmd == "HDEL") return handleHDel(args);
+    if (cmd == "HEXISTS") return handleHExists(args);
+    if (cmd == "HLEN") return handleHLen(args);
+    
+    // Sorted set commands
+    if (cmd == "ZADD") return handleZAdd(args);
+    if (cmd == "ZSCORE") return handleZScore(args);
+    if (cmd == "ZRANK") return handleZRank(args);
+    if (cmd == "ZRANGE") return handleZRange(args);
+    if (cmd == "ZCOUNT") return handleZCount(args);
+    if (cmd == "ZCARD") return handleZCard(args);
+    if (cmd == "ZREM") return handleZRem(args);
+    
+    // Stream commands
     if (cmd == "XADD") return handleXAdd(args);
     if (cmd == "XRANGE") return handleXRange(args);
     if (cmd == "XREAD") return handleXRead(args);
+    
+    // Transaction commands
+    if (cmd == "MULTI") return handleMulti(args, clientFd);
+    if (cmd == "EXEC") return handleExec(args, clientFd);
+    if (cmd == "DISCARD") return handleDiscard(args, clientFd);
+    
+    // Replication commands
     if (cmd == "REPLCONF") return handleReplConf(args);
     if (cmd == "PSYNC") return handlePSync(args, clientFd);
     if (cmd == "WAIT") return handleWait(args);
