@@ -1,3 +1,26 @@
+/**
+ * =============================================================================
+ *                              REDIS MAIN
+ * =============================================================================
+ * 
+ * Paaji eh hai main entry point - jithon sab shuru hunda hai!
+ * (Bro this is the main entry point - where everything starts!)
+ * 
+ * CLI arguments parse karke server start karna
+ * (Parse CLI arguments and start the server)
+ * 
+ * Jiven dukaan da darwaza - sab yahan se andar aunde ne
+ * (Like the shop's entrance - everyone enters from here)
+ * 
+ * Usage:
+ *   ./your_program.sh                     # Default port 6379
+ *   ./your_program.sh --port 6380         # Custom port
+ *   ./your_program.sh --replicaof <host> <port>   # Start as replica
+ *   ./your_program.sh --dir /tmp --dbfilename dump.rdb  # RDB config
+ *
+ * =============================================================================
+ */
+
 #include <iostream>
 #include <cstdlib>
 #include <string>
@@ -5,57 +28,1301 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/epoll.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <vector>
+#include <map>
+#include <unordered_map>
+#include <unordered_set>
+#include <deque>
+#include <sstream>
+#include <fstream>
+#include <optional>
+#include <chrono>
+#include <thread>
+#include <mutex>
+#include <shared_mutex>
+#include <filesystem>
+#include <algorithm>
+#include <regex>
+#include <iomanip>
+
+// ============================================================================
+// PINGLISH COMMENTS LEGEND:
+// Paaji = Bro
+// Oye = Hey
+// Ki haal hai = How's it going
+// Koi nahi = No worries
+// Sab theek = All good
+// ============================================================================
+
+// ============================================================================
+// CONFIGURATION
+// Server di settings - port, directories, etc.
+// (Server settings - port, directories, etc.)
+// ============================================================================
+
+struct Config {
+    int port = 6379;
+    std::string dir = ".";
+    std::string dbfilename = "dump.rdb";
+    bool isReplica = false;
+    std::string masterHost;
+    int masterPort = 0;
+};
+
+Config gConfig;
+
+// ============================================================================
+// DATA STORE
+// Redis data rakhna - keys, values, expiry
+// (Store Redis data - keys, values, expiration)
+// ============================================================================
+
+enum class DataType { NONE, STRING, LIST, SET, HASH, ZSET, STREAM };
+
+struct StreamEntry {
+    std::string id;
+    uint64_t timestamp = 0;
+    uint64_t sequence = 0;
+    std::vector<std::pair<std::string, std::string>> fields;
+};
+
+struct RedisValue {
+    DataType type = DataType::NONE;
+    std::string stringValue;
+    std::deque<std::string> listValue;
+    std::unordered_set<std::string> setValue;
+    std::unordered_map<std::string, std::string> hashValue;
+    std::multimap<double, std::string> zsetByScore;
+    std::unordered_map<std::string, double> zsetScores;
+    std::vector<StreamEntry> streamValue;
+    uint64_t streamLastTimestamp = 0;
+    uint64_t streamLastSequence = 0;
+    int64_t expiryMs = -1;  // -1 = no expiry
+    
+    bool isExpired() const {
+        if (expiryMs < 0) return false;
+        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+        return now >= expiryMs;
+    }
+};
+
+// Global data store - thread-safe
+// Global data store - multiple threads lai safe
+// (Global data store - safe for multiple threads)
+std::unordered_map<std::string, RedisValue> gData;
+std::shared_mutex gDataMutex;
+
+// Replication state
+// Replication info - master/replica sync
+// (Replication info - for master/replica synchronization)
+std::string gReplId = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
+int64_t gReplOffset = 0;
+std::vector<int> gReplicas;
+std::mutex gReplicaMutex;
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// Helper functions - commonly used stuff
+// (Helper functions - commonly used operations)
+// ============================================================================
+
+// Get current time in milliseconds
+// Abhi da time milliseconds mein - very precise!
+// (Current time in milliseconds - very precise!)
+int64_t getCurrentTimeMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+}
+
+// Convert string to uppercase
+// String nu uppercase karo - CHOTE AKSHAR TO WADDE AKSHAR
+// (Convert string to uppercase - small to capital letters)
+std::string toUpper(const std::string& str) {
+    std::string result = str;
+    std::transform(result.begin(), result.end(), result.begin(), ::toupper);
+    return result;
+}
+
+// Simple pattern matching for KEYS command
+// Pattern match karo - * te ? support
+// (Pattern matching - supports * and ? wildcards)
+bool matchPattern(const std::string& pattern, const std::string& str) {
+    if (pattern == "*") return true;
+    
+    size_t pi = 0, si = 0;
+    size_t starIdx = std::string::npos;
+    size_t matchIdx = 0;
+    
+    while (si < str.size()) {
+        if (pi < pattern.size() && (pattern[pi] == '?' || pattern[pi] == str[si])) {
+            pi++;
+            si++;
+        } else if (pi < pattern.size() && pattern[pi] == '*') {
+            starIdx = pi;
+            matchIdx = si;
+            pi++;
+        } else if (starIdx != std::string::npos) {
+            pi = starIdx + 1;
+            matchIdx++;
+            si = matchIdx;
+        } else {
+            return false;
+        }
+    }
+    
+    while (pi < pattern.size() && pattern[pi] == '*') pi++;
+    return pi == pattern.size();
+}
+
+// ============================================================================
+// RESP PROTOCOL
+// Redis protocol parser te builder
+// (Redis protocol parser and response builder)
+// ============================================================================
+
+// Parse a RESP command from buffer
+// Buffer se command parse karo - RESP format
+// (Parse command from buffer in RESP format)
+std::vector<std::string> parseRespCommand(const std::string& buffer, size_t& consumed) {
+    std::vector<std::string> args;
+    consumed = 0;
+    
+    if (buffer.empty()) return args;
+    
+    size_t pos = 0;
+    
+    // Check for inline command (telnet style)
+    // Inline command check - telnet style bhi support
+    // (Check for inline command - support telnet style too)
+    if (buffer[0] != '*') {
+        auto endPos = buffer.find("\r\n");
+        if (endPos == std::string::npos) return args;
+        
+        std::string line = buffer.substr(0, endPos);
+        std::istringstream iss(line);
+        std::string word;
+        while (iss >> word) {
+            args.push_back(word);
+        }
+        consumed = endPos + 2;
+        return args;
+    }
+    
+    // Parse RESP array
+    // RESP array parse karo - *N format
+    // (Parse RESP array - *N format where N is count)
+    auto crlfPos = buffer.find("\r\n", pos);
+    if (crlfPos == std::string::npos) return args;
+    
+    int numArgs = std::stoi(buffer.substr(pos + 1, crlfPos - pos - 1));
+    pos = crlfPos + 2;
+    
+    for (int i = 0; i < numArgs; i++) {
+        if (pos >= buffer.size()) {
+            args.clear();
+            return args;
+        }
+        
+        if (buffer[pos] != '$') {
+            args.clear();
+            return args;
+        }
+        
+        crlfPos = buffer.find("\r\n", pos);
+        if (crlfPos == std::string::npos) {
+            args.clear();
+            return args;
+        }
+        
+        int len = std::stoi(buffer.substr(pos + 1, crlfPos - pos - 1));
+        pos = crlfPos + 2;
+        
+        if (pos + len + 2 > buffer.size()) {
+            args.clear();
+            return args;
+        }
+        
+        args.push_back(buffer.substr(pos, len));
+        pos = pos + len + 2;
+    }
+    
+    consumed = pos;
+    return args;
+}
+
+// RESP response builders
+// Response banao - different types lai
+// (Build responses for different types)
+
+std::string respSimpleString(const std::string& str) {
+    return "+" + str + "\r\n";
+}
+
+std::string respError(const std::string& msg) {
+    return "-" + msg + "\r\n";
+}
+
+std::string respInteger(int64_t val) {
+    return ":" + std::to_string(val) + "\r\n";
+}
+
+std::string respBulkString(const std::string& str) {
+    return "$" + std::to_string(str.length()) + "\r\n" + str + "\r\n";
+}
+
+std::string respNull() {
+    return "$-1\r\n";
+}
+
+std::string respNullArray() {
+    return "*-1\r\n";
+}
+
+std::string respArray(const std::vector<std::string>& items) {
+    std::string result = "*" + std::to_string(items.size()) + "\r\n";
+    for (const auto& item : items) {
+        result += item;
+    }
+    return result;
+}
+
+// Encode command as RESP array
+// Command nu RESP format mein encode karo
+// (Encode command in RESP format for replication)
+std::string encodeRespArray(const std::vector<std::string>& args) {
+    std::string result = "*" + std::to_string(args.size()) + "\r\n";
+    for (const auto& arg : args) {
+        result += "$" + std::to_string(arg.length()) + "\r\n" + arg + "\r\n";
+    }
+    return result;
+}
+
+// ============================================================================
+// RDB PERSISTENCE
+// RDB file reading - startup pe data load
+// (RDB file reading - load data on startup)
+// ============================================================================
+
+// Read RDB file and load data
+// RDB file read karo te data load karo
+// (Read RDB file and load data into memory)
+void loadRdb() {
+    std::string path = gConfig.dir + "/" + gConfig.dbfilename;
+    
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+        std::cout << "RDB file not found: " << path << " (starting fresh)" << std::endl;
+        return;
+    }
+    
+    std::cout << "Loading RDB from " << path << std::endl;
+    
+    try {
+        // Read magic "REDIS"
+        char magic[5];
+        file.read(magic, 5);
+        if (std::string(magic, 5) != "REDIS") {
+            std::cerr << "Invalid RDB magic" << std::endl;
+            return;
+        }
+        
+        // Read version
+        char version[4];
+        file.read(version, 4);
+        
+        int64_t currentExpiry = -1;
+        
+        while (file.good() && !file.eof()) {
+            uint8_t opcode;
+            file.read(reinterpret_cast<char*>(&opcode), 1);
+            if (!file.good()) break;
+            
+            if (opcode == 0xFF) {
+                // EOF
+                break;
+            } else if (opcode == 0xFE) {
+                // SELECTDB
+                uint8_t db;
+                file.read(reinterpret_cast<char*>(&db), 1);
+            } else if (opcode == 0xFB) {
+                // RESIZEDB
+                // Read two length-encoded integers
+                auto readLen = [&file]() -> uint64_t {
+                    uint8_t byte;
+                    file.read(reinterpret_cast<char*>(&byte), 1);
+                    uint8_t type = (byte & 0xC0) >> 6;
+                    if (type == 0) return byte & 0x3F;
+                    if (type == 1) {
+                        uint8_t next;
+                        file.read(reinterpret_cast<char*>(&next), 1);
+                        return ((byte & 0x3F) << 8) | next;
+                    }
+                    if (type == 2) {
+                        uint32_t len;
+                        file.read(reinterpret_cast<char*>(&len), 4);
+                        return len;
+                    }
+                    return 0;
+                };
+                readLen();  // hash table size
+                readLen();  // expires hash table size
+            } else if (opcode == 0xFA) {
+                // AUX field
+                auto readString = [&file]() -> std::string {
+                    uint8_t byte;
+                    file.read(reinterpret_cast<char*>(&byte), 1);
+                    uint8_t type = (byte & 0xC0) >> 6;
+                    
+                    uint64_t len = 0;
+                    if (type == 3) {
+                        // Special encoding - integer
+                        uint8_t fmt = byte & 0x3F;
+                        if (fmt == 0) {
+                            int8_t val;
+                            file.read(reinterpret_cast<char*>(&val), 1);
+                            return std::to_string(val);
+                        } else if (fmt == 1) {
+                            int16_t val;
+                            file.read(reinterpret_cast<char*>(&val), 2);
+                            return std::to_string(val);
+                        } else if (fmt == 2) {
+                            int32_t val;
+                            file.read(reinterpret_cast<char*>(&val), 4);
+                            return std::to_string(val);
+                        }
+                        return "";
+                    } else if (type == 0) {
+                        len = byte & 0x3F;
+                    } else if (type == 1) {
+                        uint8_t next;
+                        file.read(reinterpret_cast<char*>(&next), 1);
+                        len = ((byte & 0x3F) << 8) | next;
+                    } else if (type == 2) {
+                        uint32_t len32;
+                        file.read(reinterpret_cast<char*>(&len32), 4);
+                        len = len32;
+                    }
+                    
+                    std::string result(len, '\0');
+                    file.read(&result[0], len);
+                    return result;
+                };
+                
+                std::string auxKey = readString();
+                std::string auxValue = readString();
+                std::cout << "RDB aux: " << auxKey << " = " << auxValue << std::endl;
+            } else if (opcode == 0xFD) {
+                // Expiry in seconds
+                uint32_t expiry;
+                file.read(reinterpret_cast<char*>(&expiry), 4);
+                currentExpiry = static_cast<int64_t>(expiry) * 1000;
+            } else if (opcode == 0xFC) {
+                // Expiry in milliseconds
+                file.read(reinterpret_cast<char*>(&currentExpiry), 8);
+            } else {
+                // Value type
+                auto readString = [&file]() -> std::string {
+                    uint8_t byte;
+                    file.read(reinterpret_cast<char*>(&byte), 1);
+                    uint8_t type = (byte & 0xC0) >> 6;
+                    
+                    uint64_t len = 0;
+                    if (type == 3) {
+                        uint8_t fmt = byte & 0x3F;
+                        if (fmt == 0) {
+                            int8_t val;
+                            file.read(reinterpret_cast<char*>(&val), 1);
+                            return std::to_string(val);
+                        } else if (fmt == 1) {
+                            int16_t val;
+                            file.read(reinterpret_cast<char*>(&val), 2);
+                            return std::to_string(val);
+                        } else if (fmt == 2) {
+                            int32_t val;
+                            file.read(reinterpret_cast<char*>(&val), 4);
+                            return std::to_string(val);
+                        }
+                        return "";
+                    } else if (type == 0) {
+                        len = byte & 0x3F;
+                    } else if (type == 1) {
+                        uint8_t next;
+                        file.read(reinterpret_cast<char*>(&next), 1);
+                        len = ((byte & 0x3F) << 8) | next;
+                    } else if (type == 2) {
+                        uint32_t len32;
+                        file.read(reinterpret_cast<char*>(&len32), 4);
+                        len = len32;
+                    }
+                    
+                    std::string result(len, '\0');
+                    file.read(&result[0], len);
+                    return result;
+                };
+                
+                std::string key = readString();
+                
+                if (opcode == 0) {
+                    // String type
+                    std::string value = readString();
+                    
+                    std::unique_lock lock(gDataMutex);
+                    gData[key].type = DataType::STRING;
+                    gData[key].stringValue = value;
+                    if (currentExpiry > 0) {
+                        gData[key].expiryMs = currentExpiry;
+                    }
+                }
+                // For now, only handle strings
+                
+                currentExpiry = -1;
+            }
+        }
+        
+        std::cout << "RDB loaded successfully" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "RDB parse error: " << e.what() << std::endl;
+    }
+}
+
+// ============================================================================
+// COMMAND HANDLERS
+// Redis commands implement - sab commands idher
+// (Implement Redis commands - all commands here)
+// ============================================================================
+
+// Helper to check expiry and delete if expired
+// Expiry check karo te delete karo agar expire ho gaya
+// (Check expiry and delete if expired)
+bool checkAndDeleteExpired(const std::string& key) {
+    auto it = gData.find(key);
+    if (it != gData.end() && it->second.isExpired()) {
+        gData.erase(it);
+        return true;
+    }
+    return false;
+}
+
+std::string handlePing(const std::vector<std::string>& args) {
+    if (args.size() > 1) {
+        return respBulkString(args[1]);
+    }
+    return respSimpleString("PONG");
+}
+
+std::string handleEcho(const std::vector<std::string>& args) {
+    if (args.size() < 2) {
+        return respError("ERR wrong number of arguments for 'echo' command");
+    }
+    return respBulkString(args[1]);
+}
+
+std::string handleSet(const std::vector<std::string>& args) {
+    if (args.size() < 3) {
+        return respError("ERR wrong number of arguments for 'set' command");
+    }
+    
+    const std::string& key = args[1];
+    const std::string& value = args[2];
+    int64_t expiryMs = -1;
+    bool nx = false, xx = false;
+    
+    // Parse options
+    for (size_t i = 3; i < args.size(); i++) {
+        std::string opt = toUpper(args[i]);
+        if (opt == "EX" && i + 1 < args.size()) {
+            expiryMs = getCurrentTimeMs() + std::stoll(args[++i]) * 1000;
+        } else if (opt == "PX" && i + 1 < args.size()) {
+            expiryMs = getCurrentTimeMs() + std::stoll(args[++i]);
+        } else if (opt == "EXAT" && i + 1 < args.size()) {
+            expiryMs = std::stoll(args[++i]) * 1000;
+        } else if (opt == "PXAT" && i + 1 < args.size()) {
+            expiryMs = std::stoll(args[++i]);
+        } else if (opt == "NX") {
+            nx = true;
+        } else if (opt == "XX") {
+            xx = true;
+        }
+    }
+    
+    std::unique_lock lock(gDataMutex);
+    checkAndDeleteExpired(key);
+    
+    bool exists = gData.find(key) != gData.end();
+    if (nx && exists) return respNull();
+    if (xx && !exists) return respNull();
+    
+    gData[key].type = DataType::STRING;
+    gData[key].stringValue = value;
+    gData[key].expiryMs = expiryMs;
+    
+    return respSimpleString("OK");
+}
+
+std::string handleGet(const std::vector<std::string>& args) {
+    if (args.size() < 2) {
+        return respError("ERR wrong number of arguments for 'get' command");
+    }
+    
+    std::shared_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    
+    auto it = gData.find(key);
+    if (it == gData.end() || it->second.isExpired()) {
+        return respNull();
+    }
+    
+    if (it->second.type != DataType::STRING) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    return respBulkString(it->second.stringValue);
+}
+
+std::string handleIncr(const std::vector<std::string>& args) {
+    if (args.size() < 2) {
+        return respError("ERR wrong number of arguments for 'incr' command");
+    }
+    
+    std::unique_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    checkAndDeleteExpired(key);
+    
+    auto it = gData.find(key);
+    int64_t val = 0;
+    
+    if (it != gData.end()) {
+        if (it->second.type != DataType::STRING) {
+            return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+        }
+        try {
+            val = std::stoll(it->second.stringValue);
+        } catch (...) {
+            return respError("ERR value is not an integer or out of range");
+        }
+    }
+    
+    val++;
+    gData[key].type = DataType::STRING;
+    gData[key].stringValue = std::to_string(val);
+    
+    return respInteger(val);
+}
+
+std::string handleType(const std::vector<std::string>& args) {
+    if (args.size() < 2) {
+        return respError("ERR wrong number of arguments for 'type' command");
+    }
+    
+    std::shared_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    
+    auto it = gData.find(key);
+    if (it == gData.end() || it->second.isExpired()) {
+        return respSimpleString("none");
+    }
+    
+    switch (it->second.type) {
+        case DataType::STRING: return respSimpleString("string");
+        case DataType::LIST: return respSimpleString("list");
+        case DataType::SET: return respSimpleString("set");
+        case DataType::HASH: return respSimpleString("hash");
+        case DataType::ZSET: return respSimpleString("zset");
+        case DataType::STREAM: return respSimpleString("stream");
+        default: return respSimpleString("none");
+    }
+}
+
+std::string handleKeys(const std::vector<std::string>& args) {
+    if (args.size() < 2) {
+        return respError("ERR wrong number of arguments for 'keys' command");
+    }
+    
+    std::shared_lock lock(gDataMutex);
+    const std::string& pattern = args[1];
+    
+    std::vector<std::string> result;
+    for (const auto& [key, value] : gData) {
+        if (!value.isExpired() && matchPattern(pattern, key)) {
+            result.push_back(respBulkString(key));
+        }
+    }
+    
+    return respArray(result);
+}
+
+std::string handleConfig(const std::vector<std::string>& args) {
+    if (args.size() < 3) {
+        return respError("ERR wrong number of arguments for 'config' command");
+    }
+    
+    std::string subCmd = toUpper(args[1]);
+    std::string param = args[2];
+    
+    if (subCmd == "GET") {
+        std::vector<std::string> result;
+        if (param == "dir" || param == "*") {
+            result.push_back(respBulkString("dir"));
+            result.push_back(respBulkString(gConfig.dir));
+        }
+        if (param == "dbfilename" || param == "*") {
+            result.push_back(respBulkString("dbfilename"));
+            result.push_back(respBulkString(gConfig.dbfilename));
+        }
+        return respArray(result);
+    }
+    
+    return respSimpleString("OK");
+}
+
+std::string handleInfo(const std::vector<std::string>& args) {
+    std::ostringstream ss;
+    
+    ss << "# Replication\r\n";
+    ss << "role:" << (gConfig.isReplica ? "slave" : "master") << "\r\n";
+    if (!gConfig.isReplica) {
+        ss << "master_replid:" << gReplId << "\r\n";
+        ss << "master_repl_offset:" << gReplOffset << "\r\n";
+    }
+    
+    return respBulkString(ss.str());
+}
+
+// List commands
+std::string handleLPush(const std::vector<std::string>& args) {
+    if (args.size() < 3) {
+        return respError("ERR wrong number of arguments for 'lpush' command");
+    }
+    
+    std::unique_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    checkAndDeleteExpired(key);
+    
+    auto& val = gData[key];
+    if (val.type != DataType::NONE && val.type != DataType::LIST) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    val.type = DataType::LIST;
+    for (size_t i = 2; i < args.size(); i++) {
+        val.listValue.push_front(args[i]);
+    }
+    
+    return respInteger(val.listValue.size());
+}
+
+std::string handleRPush(const std::vector<std::string>& args) {
+    if (args.size() < 3) {
+        return respError("ERR wrong number of arguments for 'rpush' command");
+    }
+    
+    std::unique_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    checkAndDeleteExpired(key);
+    
+    auto& val = gData[key];
+    if (val.type != DataType::NONE && val.type != DataType::LIST) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    val.type = DataType::LIST;
+    for (size_t i = 2; i < args.size(); i++) {
+        val.listValue.push_back(args[i]);
+    }
+    
+    return respInteger(val.listValue.size());
+}
+
+std::string handleLRange(const std::vector<std::string>& args) {
+    if (args.size() < 4) {
+        return respError("ERR wrong number of arguments for 'lrange' command");
+    }
+    
+    std::shared_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    int64_t start = std::stoll(args[2]);
+    int64_t stop = std::stoll(args[3]);
+    
+    auto it = gData.find(key);
+    if (it == gData.end() || it->second.isExpired()) {
+        return respArray({});
+    }
+    
+    if (it->second.type != DataType::LIST) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    int64_t len = it->second.listValue.size();
+    if (start < 0) start = len + start;
+    if (stop < 0) stop = len + stop;
+    if (start < 0) start = 0;
+    if (stop >= len) stop = len - 1;
+    
+    std::vector<std::string> result;
+    for (int64_t i = start; i <= stop && i < len; i++) {
+        result.push_back(respBulkString(it->second.listValue[i]));
+    }
+    
+    return respArray(result);
+}
+
+// Stream commands
+std::string handleXAdd(const std::vector<std::string>& args) {
+    if (args.size() < 5) {
+        return respError("ERR wrong number of arguments for 'xadd' command");
+    }
+    
+    std::unique_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    std::string id = args[2];
+    
+    auto& val = gData[key];
+    if (val.type != DataType::NONE && val.type != DataType::STREAM) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    val.type = DataType::STREAM;
+    
+    uint64_t timestamp, sequence;
+    
+    if (id == "*") {
+        timestamp = getCurrentTimeMs();
+        if (timestamp == val.streamLastTimestamp) {
+            sequence = val.streamLastSequence + 1;
+        } else if (timestamp <= val.streamLastTimestamp) {
+            timestamp = val.streamLastTimestamp;
+            sequence = val.streamLastSequence + 1;
+        } else {
+            sequence = 0;
+        }
+    } else {
+        auto dashPos = id.find('-');
+        if (dashPos == std::string::npos) {
+            return respError("ERR Invalid stream ID specified as stream command argument");
+        }
+        
+        std::string tsStr = id.substr(0, dashPos);
+        std::string seqStr = id.substr(dashPos + 1);
+        
+        if (seqStr == "*") {
+            timestamp = std::stoull(tsStr);
+            if (timestamp == val.streamLastTimestamp) {
+                sequence = val.streamLastSequence + 1;
+            } else if (timestamp > val.streamLastTimestamp) {
+                sequence = 0;
+            } else {
+                return respError("ERR The ID specified in XADD is equal or smaller than the target stream top item");
+            }
+        } else {
+            timestamp = std::stoull(tsStr);
+            sequence = std::stoull(seqStr);
+        }
+        
+        if (timestamp == 0 && sequence == 0) {
+            return respError("ERR The ID specified in XADD must be greater than 0-0");
+        }
+        
+        if (timestamp < val.streamLastTimestamp ||
+            (timestamp == val.streamLastTimestamp && sequence <= val.streamLastSequence)) {
+            return respError("ERR The ID specified in XADD is equal or smaller than the target stream top item");
+        }
+    }
+    
+    StreamEntry entry;
+    entry.timestamp = timestamp;
+    entry.sequence = sequence;
+    entry.id = std::to_string(timestamp) + "-" + std::to_string(sequence);
+    
+    for (size_t i = 3; i + 1 < args.size(); i += 2) {
+        entry.fields.emplace_back(args[i], args[i + 1]);
+    }
+    
+    val.streamValue.push_back(entry);
+    val.streamLastTimestamp = timestamp;
+    val.streamLastSequence = sequence;
+    
+    return respBulkString(entry.id);
+}
+
+std::string handleXRange(const std::vector<std::string>& args) {
+    if (args.size() < 4) {
+        return respError("ERR wrong number of arguments for 'xrange' command");
+    }
+    
+    std::shared_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    std::string start = args[2];
+    std::string end = args[3];
+    
+    auto it = gData.find(key);
+    if (it == gData.end() || it->second.isExpired()) {
+        return respArray({});
+    }
+    
+    if (it->second.type != DataType::STREAM) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    if (start == "-") start = "0-0";
+    if (end == "+") end = "18446744073709551615-18446744073709551615";
+    
+    std::vector<std::string> result;
+    for (const auto& entry : it->second.streamValue) {
+        bool include = true;
+        
+        // Simple ID comparison
+        if (start != "-") {
+            auto [ts1, seq1] = std::make_pair(entry.timestamp, entry.sequence);
+            auto dashPos = start.find('-');
+            if (dashPos != std::string::npos) {
+                uint64_t startTs = std::stoull(start.substr(0, dashPos));
+                uint64_t startSeq = std::stoull(start.substr(dashPos + 1));
+                if (ts1 < startTs || (ts1 == startTs && seq1 < startSeq)) {
+                    include = false;
+                }
+            }
+        }
+        
+        if (end != "+") {
+            auto [ts1, seq1] = std::make_pair(entry.timestamp, entry.sequence);
+            auto dashPos = end.find('-');
+            if (dashPos != std::string::npos) {
+                uint64_t endTs = std::stoull(end.substr(0, dashPos));
+                uint64_t endSeq = std::stoull(end.substr(dashPos + 1));
+                if (ts1 > endTs || (ts1 == endTs && seq1 > endSeq)) {
+                    include = false;
+                }
+            }
+        }
+        
+        if (include) {
+            std::vector<std::string> entryArr;
+            entryArr.push_back(respBulkString(entry.id));
+            
+            std::vector<std::string> fieldsArr;
+            for (const auto& [field, value] : entry.fields) {
+                fieldsArr.push_back(respBulkString(field));
+                fieldsArr.push_back(respBulkString(value));
+            }
+            entryArr.push_back(respArray(fieldsArr));
+            
+            result.push_back(respArray(entryArr));
+        }
+    }
+    
+    return respArray(result);
+}
+
+std::string handleXRead(const std::vector<std::string>& args) {
+    // Parse XREAD args
+    size_t streamsIdx = 0;
+    int64_t blockMs = -1;
+    int64_t count = -1;
+    
+    for (size_t i = 1; i < args.size(); i++) {
+        std::string opt = toUpper(args[i]);
+        if (opt == "BLOCK" && i + 1 < args.size()) {
+            blockMs = std::stoll(args[++i]);
+        } else if (opt == "COUNT" && i + 1 < args.size()) {
+            count = std::stoll(args[++i]);
+        } else if (opt == "STREAMS") {
+            streamsIdx = i + 1;
+            break;
+        }
+    }
+    
+    if (streamsIdx == 0 || streamsIdx >= args.size()) {
+        return respError("ERR syntax error");
+    }
+    
+    size_t numStreams = (args.size() - streamsIdx) / 2;
+    std::vector<std::string> keys;
+    std::vector<std::string> ids;
+    
+    for (size_t i = 0; i < numStreams; i++) {
+        keys.push_back(args[streamsIdx + i]);
+        ids.push_back(args[streamsIdx + numStreams + i]);
+    }
+    
+    auto readStreams = [&]() -> std::string {
+        std::shared_lock lock(gDataMutex);
+        std::vector<std::string> result;
+        
+        for (size_t i = 0; i < keys.size(); i++) {
+            auto it = gData.find(keys[i]);
+            if (it == gData.end() || it->second.type != DataType::STREAM) {
+                continue;
+            }
+            
+            std::string startId = ids[i];
+            if (startId == "$") {
+                // Start from newest
+                if (it->second.streamValue.empty()) {
+                    startId = "0-0";
+                } else {
+                    startId = it->second.streamValue.back().id;
+                }
+            }
+            
+            std::vector<std::string> entries;
+            int64_t cnt = 0;
+            
+            for (const auto& entry : it->second.streamValue) {
+                // Compare IDs
+                auto dashPos1 = entry.id.find('-');
+                auto dashPos2 = startId.find('-');
+                
+                uint64_t ts1 = std::stoull(entry.id.substr(0, dashPos1));
+                uint64_t seq1 = std::stoull(entry.id.substr(dashPos1 + 1));
+                uint64_t ts2 = std::stoull(startId.substr(0, dashPos2));
+                uint64_t seq2 = std::stoull(startId.substr(dashPos2 + 1));
+                
+                if (ts1 > ts2 || (ts1 == ts2 && seq1 > seq2)) {
+                    std::vector<std::string> entryArr;
+                    entryArr.push_back(respBulkString(entry.id));
+                    
+                    std::vector<std::string> fieldsArr;
+                    for (const auto& [field, value] : entry.fields) {
+                        fieldsArr.push_back(respBulkString(field));
+                        fieldsArr.push_back(respBulkString(value));
+                    }
+                    entryArr.push_back(respArray(fieldsArr));
+                    entries.push_back(respArray(entryArr));
+                    
+                    cnt++;
+                    if (count > 0 && cnt >= count) break;
+                }
+            }
+            
+            if (!entries.empty()) {
+                std::vector<std::string> streamArr;
+                streamArr.push_back(respBulkString(keys[i]));
+                streamArr.push_back(respArray(entries));
+                result.push_back(respArray(streamArr));
+            }
+        }
+        
+        if (result.empty()) {
+            return "";
+        }
+        return respArray(result);
+    };
+    
+    std::string response = readStreams();
+    if (!response.empty()) {
+        return response;
+    }
+    
+    if (blockMs >= 0) {
+        // Blocking read
+        auto deadline = std::chrono::steady_clock::now() + 
+                        std::chrono::milliseconds(blockMs == 0 ? 100000000 : blockMs);
+        
+        while (std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            response = readStreams();
+            if (!response.empty()) {
+                return response;
+            }
+        }
+    }
+    
+    return respNullArray();
+}
+
+// Replication commands
+std::string handleReplConf(const std::vector<std::string>& args) {
+    // Just ACK for now
+    return respSimpleString("OK");
+}
+
+std::string handlePSync(const std::vector<std::string>& args, int clientFd) {
+    // Send FULLRESYNC
+    std::string response = "+FULLRESYNC " + gReplId + " 0\r\n";
+    write(clientFd, response.c_str(), response.length());
+    
+    // Send empty RDB
+    std::string rdb;
+    rdb += "REDIS0011";  // Magic + version
+    rdb += "\xfa";  // AUX
+    rdb += "\x09redis-ver\x05""7.2.0";
+    rdb += "\xff";  // EOF
+    
+    // Add 8 zero bytes for checksum
+    rdb += std::string(8, '\0');
+    
+    std::string rdbResp = "$" + std::to_string(rdb.length()) + "\r\n" + rdb;
+    write(clientFd, rdbResp.c_str(), rdbResp.length());
+    
+    // Add to replicas list
+    {
+        std::lock_guard<std::mutex> lock(gReplicaMutex);
+        gReplicas.push_back(clientFd);
+    }
+    
+    return "";  // Already sent response
+}
+
+std::string handleWait(const std::vector<std::string>& args) {
+    if (args.size() < 3) {
+        return respError("ERR wrong number of arguments for 'wait' command");
+    }
+    
+    int numReplicas = std::stoi(args[1]);
+    int64_t timeout = std::stoll(args[2]);
+    
+    // Send REPLCONF GETACK to all replicas
+    std::string getack = encodeRespArray({"REPLCONF", "GETACK", "*"});
+    
+    {
+        std::lock_guard<std::mutex> lock(gReplicaMutex);
+        for (int fd : gReplicas) {
+            write(fd, getack.c_str(), getack.length());
+        }
+    }
+    
+    // Wait for timeout
+    std::this_thread::sleep_for(std::chrono::milliseconds(timeout));
+    
+    // Return number of connected replicas
+    std::lock_guard<std::mutex> lock(gReplicaMutex);
+    return respInteger(std::min(static_cast<int>(gReplicas.size()), numReplicas));
+}
+
+// ============================================================================
+// COMMAND DISPATCHER
+// Command dispatch karo - right handler nu bhejo
+// (Dispatch command to the right handler)
+// ============================================================================
+
+std::string handleCommand(const std::vector<std::string>& args, int clientFd) {
+    if (args.empty()) {
+        return respError("ERR empty command");
+    }
+    
+    std::string cmd = toUpper(args[0]);
+    
+    if (cmd == "PING") return handlePing(args);
+    if (cmd == "ECHO") return handleEcho(args);
+    if (cmd == "SET") return handleSet(args);
+    if (cmd == "GET") return handleGet(args);
+    if (cmd == "INCR") return handleIncr(args);
+    if (cmd == "TYPE") return handleType(args);
+    if (cmd == "KEYS") return handleKeys(args);
+    if (cmd == "CONFIG") return handleConfig(args);
+    if (cmd == "INFO") return handleInfo(args);
+    if (cmd == "LPUSH") return handleLPush(args);
+    if (cmd == "RPUSH") return handleRPush(args);
+    if (cmd == "LRANGE") return handleLRange(args);
+    if (cmd == "XADD") return handleXAdd(args);
+    if (cmd == "XRANGE") return handleXRange(args);
+    if (cmd == "XREAD") return handleXRead(args);
+    if (cmd == "REPLCONF") return handleReplConf(args);
+    if (cmd == "PSYNC") return handlePSync(args, clientFd);
+    if (cmd == "WAIT") return handleWait(args);
+    
+    return respError("ERR unknown command '" + cmd + "'");
+}
+
+// ============================================================================
+// MAIN FUNCTION
+// Main function - jithon sab shuru hunda hai
+// (Main function - where everything begins)
+// ============================================================================
 
 int main(int argc, char **argv) {
-  // Flush after every std::cout / std::cerr
-  std::cout << std::unitbuf;
-  std::cerr << std::unitbuf;
-  
-  int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (server_fd < 0) {
-   std::cerr << "Failed to create server socket\n";
-   return 1;
-  }
-  
-  // Since the tester restarts your program quite often, setting SO_REUSEADDR
-  // ensures that we don't run into 'Address already in use' errors
-  int reuse = 1;
-  if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
-    std::cerr << "setsockopt failed\n";
-    return 1;
-  }
-  
-  struct sockaddr_in server_addr;
-  server_addr.sin_family = AF_INET;
-  server_addr.sin_addr.s_addr = INADDR_ANY;
-  server_addr.sin_port = htons(6379);
-  
-  if (bind(server_fd, (struct sockaddr *) &server_addr, sizeof(server_addr)) != 0) {
-    std::cerr << "Failed to bind to port 6379\n";
-    return 1;
-  }
-  
-  int connection_backlog = 5;
-  if (listen(server_fd, connection_backlog) != 0) {
-    std::cerr << "listen failed\n";
-    return 1;
-  }
-  
-  struct sockaddr_in client_addr;
-  int client_addr_len = sizeof(client_addr);
-  std::cout << "Waiting for a client to connect...\n";
-
-  // You can use print statements as follows for debugging, they'll be visible when running tests.
-  std::cout << "Logs from your program will appear here!\n";
-
-  // Uncomment the code below to pass the first stage
-  
-  accept(server_fd, (struct sockaddr *) &client_addr, (socklen_t *) &client_addr_len);
-  std::cout << "Client connected\n";
-  
-  close(server_fd);
-
-  return 0;
+    // Flush after every std::cout / std::cerr
+    std::cout << std::unitbuf;
+    std::cerr << std::unitbuf;
+    
+    // Ignore SIGPIPE
+    signal(SIGPIPE, SIG_IGN);
+    
+    // Parse command line arguments
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--port" && i + 1 < argc) {
+            gConfig.port = std::stoi(argv[++i]);
+        } else if (arg == "--dir" && i + 1 < argc) {
+            gConfig.dir = argv[++i];
+        } else if (arg == "--dbfilename" && i + 1 < argc) {
+            gConfig.dbfilename = argv[++i];
+        } else if (arg == "--replicaof" && i + 2 < argc) {
+            gConfig.isReplica = true;
+            gConfig.masterHost = argv[++i];
+            gConfig.masterPort = std::stoi(argv[++i]);
+        }
+    }
+    
+    std::cout << "Starting Redis server on port " << gConfig.port << std::endl;
+    
+    // Load RDB
+    loadRdb();
+    
+    // Create server socket
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        std::cerr << "Failed to create socket\n";
+        return 1;
+    }
+    
+    int reuse = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    
+    struct sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(gConfig.port);
+    
+    if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) != 0) {
+        std::cerr << "Failed to bind to port " << gConfig.port << "\n";
+        return 1;
+    }
+    
+    if (listen(server_fd, SOMAXCONN) != 0) {
+        std::cerr << "Listen failed\n";
+        return 1;
+    }
+    
+    // Set non-blocking
+    fcntl(server_fd, F_SETFL, O_NONBLOCK);
+    
+    // Connect to master if replica
+    int masterFd = -1;
+    if (gConfig.isReplica) {
+        masterFd = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in master_addr;
+        master_addr.sin_family = AF_INET;
+        master_addr.sin_port = htons(gConfig.masterPort);
+        inet_pton(AF_INET, gConfig.masterHost.c_str(), &master_addr.sin_addr);
+        
+        if (connect(masterFd, (struct sockaddr *)&master_addr, sizeof(master_addr)) == 0) {
+            std::cout << "Connected to master\n";
+            
+            // Handshake
+            std::string ping = encodeRespArray({"PING"});
+            write(masterFd, ping.c_str(), ping.length());
+            
+            char buf[1024];
+            read(masterFd, buf, sizeof(buf));
+            
+            std::string replconf1 = encodeRespArray({"REPLCONF", "listening-port", std::to_string(gConfig.port)});
+            write(masterFd, replconf1.c_str(), replconf1.length());
+            read(masterFd, buf, sizeof(buf));
+            
+            std::string replconf2 = encodeRespArray({"REPLCONF", "capa", "psync2"});
+            write(masterFd, replconf2.c_str(), replconf2.length());
+            read(masterFd, buf, sizeof(buf));
+            
+            std::string psync = encodeRespArray({"PSYNC", "?", "-1"});
+            write(masterFd, psync.c_str(), psync.length());
+            
+            // Read FULLRESYNC response
+            read(masterFd, buf, sizeof(buf));
+            
+            fcntl(masterFd, F_SETFL, O_NONBLOCK);
+        }
+    }
+    
+    // Create epoll
+    int epoll_fd = epoll_create1(0);
+    
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = server_fd;
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev);
+    
+    if (masterFd >= 0) {
+        ev.events = EPOLLIN;
+        ev.data.fd = masterFd;
+        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, masterFd, &ev);
+    }
+    
+    std::map<int, std::string> clientBuffers;
+    
+    struct epoll_event events[64];
+    
+    std::cout << "Server ready to accept connections\n";
+    
+    while (true) {
+        int nfds = epoll_wait(epoll_fd, events, 64, 100);
+        
+        for (int i = 0; i < nfds; i++) {
+            int fd = events[i].data.fd;
+            
+            if (fd == server_fd) {
+                // Accept new connection
+                struct sockaddr_in client_addr;
+                socklen_t client_len = sizeof(client_addr);
+                int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+                
+                if (client_fd >= 0) {
+                    fcntl(client_fd, F_SETFL, O_NONBLOCK);
+                    
+                    ev.events = EPOLLIN;
+                    ev.data.fd = client_fd;
+                    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev);
+                    
+                    clientBuffers[client_fd] = "";
+                }
+            } else {
+                // Read from client
+                char buffer[4096];
+                ssize_t n = read(fd, buffer, sizeof(buffer));
+                
+                if (n <= 0) {
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+                    close(fd);
+                    clientBuffers.erase(fd);
+                    continue;
+                }
+                
+                clientBuffers[fd] += std::string(buffer, n);
+                
+                // Process commands
+                while (true) {
+                    size_t consumed = 0;
+                    auto args = parseRespCommand(clientBuffers[fd], consumed);
+                    
+                    if (args.empty()) break;
+                    
+                    clientBuffers[fd] = clientBuffers[fd].substr(consumed);
+                    
+                    // Skip processing if from master
+                    if (fd == masterFd) {
+                        std::string cmd = toUpper(args[0]);
+                        if (cmd == "SET" || cmd == "XADD") {
+                            handleCommand(args, fd);
+                        }
+                        continue;
+                    }
+                    
+                    std::string response = handleCommand(args, fd);
+                    
+                    if (!response.empty()) {
+                        write(fd, response.c_str(), response.length());
+                    }
+                    
+                    // Propagate to replicas for write commands
+                    std::string cmd = toUpper(args[0]);
+                    if (!gConfig.isReplica && (cmd == "SET" || cmd == "XADD")) {
+                        std::string encoded = encodeRespArray(args);
+                        std::lock_guard<std::mutex> lock(gReplicaMutex);
+                        for (int replicaFd : gReplicas) {
+                            write(replicaFd, encoded.c_str(), encoded.length());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    return 0;
 }
