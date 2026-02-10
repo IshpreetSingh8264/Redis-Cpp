@@ -774,6 +774,30 @@ std::string handleLRange(const std::vector<std::string>& args) {
     return respArray(result);
 }
 
+std::string handleLLen(const std::vector<std::string>& args) {
+    // LLEN - list di length pata karo
+    // (LLEN - find out the length of the list)
+    if (args.size() < 2) {
+        return respError("ERR wrong number of arguments for 'llen' command");
+    }
+    
+    std::shared_lock lock(gDataMutex);
+    const std::string& key = args[1];
+    
+    auto it = gData.find(key);
+    if (it == gData.end() || it->second.isExpired()) {
+        // List nahi mili - 0 return karo
+        // (List not found - return 0)
+        return respInteger(0);
+    }
+    
+    if (it->second.type != DataType::LIST) {
+        return respError("WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    
+    return respInteger(it->second.listValue.size());
+}
+
 // Stream commands
 std::string handleXAdd(const std::vector<std::string>& args) {
     if (args.size() < 5) {
@@ -1121,6 +1145,7 @@ std::string handleCommand(const std::vector<std::string>& args, int clientFd) {
     if (cmd == "LPUSH") return handleLPush(args);
     if (cmd == "RPUSH") return handleRPush(args);
     if (cmd == "LRANGE") return handleLRange(args);
+    if (cmd == "LLEN") return handleLLen(args);
     if (cmd == "XADD") return handleXAdd(args);
     if (cmd == "XRANGE") return handleXRange(args);
     if (cmd == "XREAD") return handleXRead(args);
