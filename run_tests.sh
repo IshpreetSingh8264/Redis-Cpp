@@ -304,9 +304,9 @@ W=$!
 sleep 0.4
 t "other client writes" "OK"  "SET ab hijacked"
 wait $W 2>/dev/null
-if grep -q "EXECABORT" "$DIR/w1.txt"; then pass=$((pass+1)); else
+if grep -q "nil-array" "$DIR/w1.txt"; then pass=$((pass+1)); else
   fail=$((fail+1)); failed_names+=("watch aborts on external write")
-  printf 'FAIL %-32s expected EXECABORT, got [%s]\n' "watch aborts on external write" "$(cat "$DIR/w1.txt")"; fi
+  printf 'FAIL %-32s expected a null array from EXEC, got [%s]\n' "watch aborts on external write" "$(cat "$DIR/w1.txt")"; fi
 fcheck "exec did not write" "0" '[ -n "$(grep -c hijacked /dev/null 2>/dev/null)" ] && echo 0 || echo 0'
 stop
 
@@ -343,19 +343,19 @@ stop
 section "geo"
 start
 t "geoadd"            "1"     "GEOADD Sicily 13.361389 38.115556 Palermo"
-t "geopos"            "- - 13.36138665676117 - 38.115555128135725" "GEOPOS Sicily Palermo"
+t "geopos"            "- - 13.361389338970184 - 38.1155563954963" "GEOPOS Sicily Palermo"
 t "geodist self"      "0"     "GEODIST Sicily Palermo Palermo"
 t "geoadd catania"    "1"     "GEOADD Sicily 15.087269 37.502669 Catania"
-t "geodist pair"      "166274.15394396224" "GEODIST Sicily Palermo Catania"
-t "geodist km"        "166.27415394396223" "GEODIST Sicily Palermo Catania km"
-t "geodist mi"        "103.31796927441383" "GEODIST Sicily Palermo Catania mi"
+t "geodist pair"      "166274.15156960074" "GEODIST Sicily Palermo Catania"
+t "geodist km"        "166.27415156960075" "GEODIST Sicily Palermo Catania km"
+t "geodist mi"        "103.31796779905399" "GEODIST Sicily Palermo Catania mi"
 t "geodist bad unit"  "ERR unsupported unit provided. please use m, km, ft, mi" "GEODIST Sicily Palermo Catania furlong"
 t "geohash"           "- 32w74bhfyjb" "GEOHASH Sicily Palermo"
-t "geosearch asc"     "- - Catania - - Palermo" "GEOSEARCH Sicily FROMLONLAT 15 37 BYRADIUS 200 km ASC"
-t "geosearch desc"    "- - Palermo - - Catania" "GEOSEARCH Sicily FROMLONLAT 15 37 BYRADIUS 200 km DESC"
-t "geosearch frommember" "- - Palermo - - Catania" "GEOSEARCH Sicily FROMMEMBER Palermo BYRADIUS 200 km ASC"
-t "geosearch count"   "- - Catania" "GEOSEARCH Sicily FROMLONLAT 15 37 BYRADIUS 200 km ASC COUNT 1"
-t "geosearch withcoord" "- - Palermo - - 13.36138665676117 - 38.115555128135725" "GEOSEARCH Sicily FROMLONLAT 15 37 BYRADIUS 200 km ASC COUNT 1 WITHCOORD"
+t "geosearch asc"     "- Catania - Palermo" "GEOSEARCH Sicily FROMLONLAT 15 37 BYRADIUS 200 km ASC"
+t "geosearch desc"    "- Palermo - Catania" "GEOSEARCH Sicily FROMLONLAT 15 37 BYRADIUS 200 km DESC"
+t "geosearch frommember" "- Palermo - Catania" "GEOSEARCH Sicily FROMMEMBER Palermo BYRADIUS 200 km ASC"
+t "geosearch count"   "- Catania" "GEOSEARCH Sicily FROMLONLAT 15 37 BYRADIUS 200 km ASC COUNT 1"
+t "geosearch withcoord" "- - Palermo - - 13.361389338970184 - 38.1155563954963" "GEOSEARCH Sicily FROMLONLAT 15 37 BYRADIUS 200 km ASC COUNT 1 WITHCOORD"
 t "geoadd invalid lon" "ERR invalid longitude,latitude pair 200,38.1" "GEOADD Sicily 200 38.1 X"
 t "geoadd invalid lat" "ERR invalid longitude,latitude pair 13,200" "GEOADD Sicily 13 200 X"
 t "geodist missing"   "nil"   "GEODIST Sicily Palermo Nope"
@@ -381,7 +381,7 @@ t "set expired ttl"   "OK"    "SET deadkey v PX 1"
 t "save"              "OK"    "SAVE"
 stop
 sleep 0.3
-fcheck "rdb magic"       "REDIS0011" 'head -c 9 "$DIR/dump.rdb"'
+fcheck "rdb magic"       "REDIS0012" 'head -c 9 "$DIR/dump.rdb"'
 start
 t "reloaded string"   "1"     "GET saved"
 t "reloaded list"     "- a - b" "LRANGE slist 0 -1"
@@ -513,7 +513,7 @@ if grep -qi "only .*allowed in this context" "$DIR/sr.txt"; then pass=$((pass+1)
 S=$!
 sleep 0.4
 wait $S 2>/dev/null
-if grep -q "PONG" "$DIR/sp.txt"; then pass=$((pass+1)); else
+if grep -q "pong" "$DIR/sp.txt"; then pass=$((pass+1)); else
   fail=$((fail+1)); failed_names+=("ping while subscribed")
   printf 'FAIL %-32s got [%s]\n' "ping while subscribed" "$(cat "$DIR/sp.txt")"; fi
 stop

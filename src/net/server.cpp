@@ -527,6 +527,12 @@ void RedisServer::closeConnection(int fd) {
 void RedisServer::tick() {
     blocked_.expireTimedOut();
 
+    // Answer any WAIT that could not be resolved when it was issued. The replica
+    // acks arrive on their own sockets, so they can only be read while the event
+    // loop is running - which is why WAIT parks itself here instead of sleeping
+    // inside command dispatch.
+    replication_.flushPendingWaits();
+
     // A handshake that failed mid-flight reports itself once, rather than
     // leaving `master_link_status:down` with nothing to say why.
     if (config_.isReplica && !linkErrorReported_ && !replication_.lastError().empty()) {

@@ -137,30 +137,21 @@ int ReplicationManager::countAcks(int64_t target) const {
     return acked;
 }
 
-int ReplicationManager::waitForReplicas(int numReplicas, int64_t timeoutMs) {
+int ReplicationManager::waitForReplicas(int numReplicas, int64_t timeoutMs, int clientFd) {
     if (numReplicas <= 0) return 0;
     if (!config_->isReplica && replicas_.empty()) return 0;
 
-    // The offset the caller is waiting for is the one that was current when
-    // WAIT was issued, so writes issued by *other* clients after this point do
-    // not make this WAIT succeed.
+    // The offset the client is waiting for is the one current when WAIT was
+    // issued, so writes issued by *other* clients after this point do not make
+    // this WAIT succeed.
     const int64_t target = offset();
     const int64_t deadline = timeutil::steadyMs() + timeoutMs;
 
-    // Ask once, then wait. redis does the same: waitCommand() calls
-    // replicationRequestAckFromSlaves(), which only sets a flag, and
-    // beforeSleep() consumes it with sendGetackToReplicas() and clears it --
-    // one REPLCONF GETACK per event loop iteration in which a client blocked.
-    //
-    // Re-asking on a timer instead fills the link. A replica reads exactly one
-    // GETACK per WAIT and treats the next one as unexpected data in its
-    // replication stream, so a poll loop makes WAIT fail for the very replicas
-    // that were going to ack.
     {
         std::lock_guard<std::mutex> lock(mutex_);
         // numReplicas is the threshold for stopping the wait early, not the
-        // number to report. redis counts *every* online replica that has
-        // acked the target and replies with that total:
+        // number to report. redis counts *every* online replica that has acked
+        // the target and replies with that total:
         //
         //     ackreplicas = replicationCountAcksByOffset(c->woff);
         //     if (ackreplicas >= numreplicas || c->flags & CLIENT_DENY_BLOCKING) {
@@ -168,29 +159,58 @@ int ReplicationManager::waitForReplicas(int numReplicas, int64_t timeoutMs) {
         //         return;
         //     }
         //
-        // and replicationCountAcksByOffset() counts without a cap. Clamping
-        // the reply to numReplicas makes `WAIT 1 500` answer 1 with three
-        // replicas attached, where redis answers 3.
+        // and replicationCountAcksByOffset() counts without a cap. Clamping the
+        // reply to numReplicas makes `WAIT 1 500` answer 1 with three replicas
+        // attached, where redis answers 3.
         const int already = countAcks(target);
         if (already >= numReplicas) return already;  // nothing to wait for
+
+        // Ask once, then wait. redis does the same: waitCommand() calls
+        // replicationRequestAckFromSlaves(), which only sets a flag, and
+        // beforeSleep() consumes it with sendGetackToReplicas() and clears it.
+        // Re-asking on a timer instead fills the link - a replica reads exactly
+        // one GETACK per WAIT and treats the next as unexpected data in its
+        // replication stream.
         for (const auto& entry : replicas_) {
             io::sendAll(entry.first, resp::encodeCommand({"REPLCONF", "GETACK", "*"}));
         }
-    }
 
-    // Block by watching the ack counters. redis can unblock a WAIT from its
-    // event loop; this runs in the middle of command dispatch, so the only way
-    // to wait here is to give up the cpu and look again.
-    for (;;) {
-        if (timeutil::steadyMs() >= deadline) break;
-        usleep(2000);
+        // Do NOT sleep here. Sleeping inside command dispatch parks the event
+        // loop, so the REPLCONF ACK we are waiting for is never read off the
+        // replica's socket and the wait can only ever time out. Hand the wait
+        // to the loop instead and answer it from flushPendingWaits().
+        if (timeoutMs > 0) {
+            pendingWaits_.push_back(PendingWait{clientFd, numReplicas, target, deadline});
+            return -1;  // deferred: the caller must not write a reply yet
+        }
+        return countAcks(target);
+    }
+}
+
+void ReplicationManager::flushPendingWaits() {
+    // Collect the replies to send outside the lock: a write to a client socket
+    // can block, and holding the replication mutex across that would stall the
+    // very replicas whose acks we are waiting for.
+    std::vector<std::pair<int, int64_t>> replies;
+    {
         std::lock_guard<std::mutex> lock(mutex_);
-        const int acked = countAcks(target);
-        if (acked >= numReplicas) return acked;
+        if (pendingWaits_.empty()) return;
+        const int64_t now = timeutil::steadyMs();
+        std::vector<PendingWait> stillWaiting;
+        stillWaiting.reserve(pendingWaits_.size());
+        for (const auto& wait : pendingWaits_) {
+            const int acked = countAcks(wait.target);
+            if (acked >= wait.numReplicas || now >= wait.deadline) {
+                replies.emplace_back(wait.clientFd, acked);
+            } else {
+                stillWaiting.push_back(wait);
+            }
+        }
+        pendingWaits_.swap(stillWaiting);
     }
-
-    std::lock_guard<std::mutex> lock(mutex_);
-    return countAcks(target);
+    for (const auto& [fd, acked] : replies) {
+        io::sendAll(fd, resp::integer(acked));
+    }
 }
 
 std::string ReplicationManager::infoReplication() const {

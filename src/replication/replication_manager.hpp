@@ -91,7 +91,16 @@ public:
 
     /// Block until `numReplicas` replicas have acked the current offset or
     /// `timeoutMs` elapses. Returns how many actually acked.
-    int waitForReplicas(int numReplicas, int64_t timeoutMs);
+    /// Begin a WAIT. Returns the number of replicas that have already acked, or
+  /// -1 when the answer is deferred: the reply is written later by
+  /// flushPendingWaits() once the acks arrive or the deadline passes. Never
+  /// blocks - redis does the same, because a blocked event loop cannot read the
+  /// very REPLCONF ACK the client is waiting for.
+  int waitForReplicas(int numReplicas, int64_t timeoutMs, int clientFd);
+
+  /// Called once per event loop iteration. Answers any deferred WAIT whose
+  /// replicas have acked the target offset, or whose deadline has passed.
+  void flushPendingWaits();
 
     std::string infoReplication() const;
 
@@ -130,6 +139,16 @@ private:
     void stepHandshake();
     void streamCommands();
     int countAcks(int64_t target) const;
+
+  /// A WAIT whose answer is not ready yet. The reply is written when the acks
+  /// land or the deadline passes - never from inside command dispatch, because a
+  /// blocked event loop cannot read the very REPLCONF ACK being waited for.
+  struct PendingWait {
+      int clientFd = -1;
+      int numReplicas = 0;
+      int64_t target = 0;
+      int64_t deadline = 0;
+  };
     void advanceOffset(int64_t bytes);
     void sendAck();
     void rdbLoadFromMaster(const std::string& blob);
@@ -142,6 +161,7 @@ private:
     mutable std::mutex mutex_;
     int64_t offset_ = 0;
     std::map<int, ReplicaLink> replicas_;
+  std::vector<PendingWait> pendingWaits_;
 
     // replica side
     int masterFd_ = -1;

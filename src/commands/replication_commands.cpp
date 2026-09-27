@@ -161,8 +161,13 @@ void registerReplicationCommands(CommandRegistry& r) {
         if (!ctx.services->replication || ctx.services->replication->isReplica()) {
             return resp::error("ERR WAIT cannot be used with replica instances");
         }
-        return resp::integer(ctx.services->replication->waitForReplicas(
-            static_cast<int>(numReplicas), timeoutMs));
+        const int acked = ctx.services->replication->waitForReplicas(
+            static_cast<int>(numReplicas), timeoutMs, ctx.fd());
+        // -1 means the wait is parked on the event loop; flushPendingWaits()
+        // answers it once the acks arrive. An empty reply is the server's
+        // existing "do not write anything" signal.
+        if (acked < 0) return std::string();
+        return resp::integer(acked);
     };
 
     r["FAILOVER"] = [](CommandContext& ctx) {
