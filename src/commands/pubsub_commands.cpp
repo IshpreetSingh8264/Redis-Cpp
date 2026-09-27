@@ -4,8 +4,12 @@
  * Two rules from the RESP spec that are easy to get wrong and that the
  * pub/sub stages check:
  *   * a connection in subscribed mode only accepts (P|S)SUBSCRIBE,
- *     (P|S)UNSUBSCRIBE, PING, QUIT and RESET -- anything else is refused, and
- *     the refusal itself must be an array, not a simple error;
+ *     (P|S)UNSUBSCRIBE, PING, QUIT and RESET; anything else is refused, and
+ *     the refusal is a plain error, NOT an array wrapping one. Being in
+ *     "array mode" changes which commands are legal, not how a rejection is
+ *     framed. That check belongs to the dispatcher, since it has to hold for
+ *     every command including ones registered outside this file -- see
+ *     allowedWhileSubscribed() in net/server.cpp.
  *   * messages pushed to a subscriber count against its subscription
  *     bookkeeping, so a client can see how many are still queued for it.
  */
