@@ -93,6 +93,14 @@ void registerTransactionCommands(CommandRegistry& r) {
 
     r["WATCH"] = [](CommandContext& ctx) {
         if (ctx.size() < 2) return wrongArity("watch");
+        // Inside MULTI there is no single client whose view could go stale
+        // between here and EXEC -- the whole queue is the unit, and EXEC
+        // already checks the watches. Refuse before touching any state, so the
+        // refused WATCH leaves no half-registered snapshot behind and the open
+        // MULTI stays usable.
+        if (ctx.client->inMulti()) {
+            return resp::error("ERR WATCH inside MULTI is not allowed");
+        }
         // Fingerprint every key once, under one read lock, so the snapshot is
         // internally consistent even if another client writes between two keys.
         ctx.services->store->read([&](const DataStore::Map& data) {
