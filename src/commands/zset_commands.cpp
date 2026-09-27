@@ -1,9 +1,11 @@
 /**
  * zset_commands.cpp -- the sorted set type.
  *
- * A zset is two views of one thing: a multimap ordered by score (for ZRANGE,
- * ZCOUNT, ZRANGEBYSCORE) and a member -> score map (for lookups). Both are
- * kept in step on every mutation.
+ * A zset is two views of one thing: a multimap keyed by score (for lookups
+ * and for persistence) and a member -> score map. Redis's own order -- score
+ * ascending, then member bytewise -- is only partly the multimap's, because
+ * that is keyed on the score alone; `orderedByScore()` completes it, and every
+ * ranked read goes through it.
  */
 #include <algorithm>
 #include <cmath>
@@ -111,15 +113,20 @@ std::string zaddGeneric(CommandContext& ctx) {
                 if ((gt && existing->second >= score) || (lt && existing->second <= score)) {
                     continue;
                 }
-                if (existing->second != score) {
-                    auto range = slot.zsetByScore.equal_range(existing->second);
-                    for (auto sit = range.first; sit != range.second; ++sit) {
-                        if (sit->second == member) {
-                            slot.zsetByScore.erase(sit);
-                            break;
-                        }
+                if (existing->second != score) changed++;
+            }
+            // The old row goes whether or not the score moved. Dropping it only
+            // on a change left a second (score, member) row behind whenever the
+            // same score was re-added, and every rank-based read then counted
+            // that member twice.
+            if (existing != slot.zsetScores.end()) {
+                auto range = slot.zsetByScore.equal_range(existing->second);
+                for (auto sit = range.first; sit != range.second;) {
+                    if (sit->second == member) {
+                        sit = slot.zsetByScore.erase(sit);
+                    } else {
+                        ++sit;
                     }
-                    changed++;
                 }
             }
             slot.zsetScores[member] = score;
@@ -131,18 +138,44 @@ std::string zaddGeneric(CommandContext& ctx) {
     });
 }
 
+/// Redis's sorted-set order: score ascending, and among equal scores the member
+/// compared bytewise. `zsetByScore` is keyed on the score alone, so its own
+/// order is only half of that and leaves tied members in whatever order they
+/// were inserted -- which is not what a "rank" means to Redis. Every read that
+/// ranks or windows by score goes through this, so ZRANGE, ZRANK,
+/// ZREMRANGEBYRANK and ZPOPMIN cannot disagree about who comes first.
+using OrderedMembers = std::vector<std::pair<double, std::string>>;
+
+OrderedMembers orderedByScore(const RedisValue& slot) {
+    OrderedMembers ordered(slot.zsetByScore.begin(), slot.zsetByScore.end());
+    std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
+        if (a.first != b.first) return a.first < b.first;
+        return a.second < b.second;
+    });
+    return ordered;
+}
+
+/// Drop the row for `member` sitting at `score` from the score index.
+void eraseFromIndex(RedisValue& slot, double score, const std::string& member) {
+    auto range = slot.zsetByScore.equal_range(score);
+    for (auto it = range.first; it != range.second;) {
+        if (it->second == member) {
+            it = slot.zsetByScore.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 /// Collect the members in ranks [from, to), optionally with their scores.
-std::vector<std::string> sliceByRank(const RedisValue& slot, int64_t from, int64_t to,
+std::vector<std::string> sliceByRank(const OrderedMembers& ordered, int64_t from, int64_t to,
                                      bool withScores) {
     std::vector<std::string> out;
-    int64_t index = 0;
-    for (const auto& [score, member] : slot.zsetByScore) {
-        if (index >= to) break;
-        if (index >= from) {
-            out.push_back(resp::bulkString(member));
-            if (withScores) out.push_back(resp::bulkString(strutil::formatScore(score)));
-        }
-        index++;
+    const int64_t last = std::min<int64_t>(to, static_cast<int64_t>(ordered.size()));
+    for (int64_t rank = std::max<int64_t>(from, 0); rank < last; rank++) {
+        const auto& [score, member] = ordered[static_cast<size_t>(rank)];
+        out.push_back(resp::bulkString(member));
+        if (withScores) out.push_back(resp::bulkString(strutil::formatScore(score)));
     }
     return out;
 }
@@ -159,6 +192,7 @@ std::string zrangeGeneric(CommandContext& ctx, bool byScore, bool reverse) {
         }
         if (it->second.type != DataType::ZSET) return resp::error(kWrongTypeError);
         const RedisValue& slot = it->second;
+        const OrderedMembers ordered = orderedByScore(slot);
 
         if (byScore) {
             // ZRANGEBYSCORE key min max, or ZRANGE key min max BYSCORE.
@@ -183,8 +217,8 @@ std::string zrangeGeneric(CommandContext& ctx, bool byScore, bool reverse) {
             }
 
             std::vector<std::pair<double, std::string>> hits;
-            for (const auto& [score, member] : slot.zsetByScore) {
-                if (withinScore(score, min, minEx, max, maxEx)) hits.push_back({score, member});
+            for (const auto& entry : ordered) {
+                if (withinScore(entry.first, min, minEx, max, maxEx)) hits.push_back(entry);
             }
             if (reverse) std::reverse(hits.begin(), hits.end());
             if (offset < static_cast<int64_t>(hits.size())) {
@@ -207,7 +241,7 @@ std::string zrangeGeneric(CommandContext& ctx, bool byScore, bool reverse) {
         if (!strutil::parseInt64(ctx[2], start) || !strutil::parseInt64(ctx[3], stop)) {
             return resp::error("ERR value is not an integer or out of range");
         }
-        const int64_t cardinality = static_cast<int64_t>(slot.zsetByScore.size());
+        const int64_t cardinality = static_cast<int64_t>(ordered.size());
         int64_t from = 0, to = 0;
         if (!normalizeRange(cardinality, start, stop, from, to)) return resp::emptyArray();
 
@@ -216,7 +250,7 @@ std::string zrangeGeneric(CommandContext& ctx, bool byScore, bool reverse) {
         // does. Mirroring the window instead (as an earlier version did) is a
         // no-op over a symmetric range, which is why ZREVRANGE used to answer
         // in ascending order.
-        std::vector<std::string> members = sliceByRank(slot, from, to, withScores);
+        std::vector<std::string> members = sliceByRank(ordered, from, to, withScores);
         if (reverse && !members.empty()) {
             const size_t width = withScores ? 2 : 1;
             const size_t pairs = members.size() / width;
@@ -238,6 +272,7 @@ std::string zremrangeGeneric(CommandContext& ctx, bool byScore) {
         if (it == data.end() || it->second.isExpired(timeutil::nowMs())) return resp::integer(0);
         if (it->second.type != DataType::ZSET) return resp::error(kWrongTypeError);
         RedisValue& slot = it->second;
+        const OrderedMembers ordered = orderedByScore(slot);
 
         std::vector<std::string> doomed;
         if (byScore) {
@@ -248,7 +283,7 @@ std::string zremrangeGeneric(CommandContext& ctx, bool byScore) {
             }
             if (minEx) min = std::nextafter(min, std::numeric_limits<double>::infinity());
             if (maxEx) max = std::nextafter(max, -std::numeric_limits<double>::infinity());
-            for (const auto& [score, member] : slot.zsetByScore) {
+            for (const auto& [score, member] : ordered) {
                 if (withinScore(score, min, minEx, max, maxEx)) doomed.push_back(member);
             }
         } else {
@@ -256,27 +291,18 @@ std::string zremrangeGeneric(CommandContext& ctx, bool byScore) {
             if (!strutil::parseInt64(ctx[2], start) || !strutil::parseInt64(ctx[3], stop)) {
                 return resp::error("ERR value is not an integer or out of range");
             }
-            const int64_t cardinality = static_cast<int64_t>(slot.zsetByScore.size());
+            const int64_t cardinality = static_cast<int64_t>(ordered.size());
             int64_t from = 0, to = 0;
             if (!normalizeRange(cardinality, start, stop, from, to)) return resp::integer(0);
-            int64_t index = 0;
-            for (const auto& [score, member] : slot.zsetByScore) {
-                if (index >= to) break;
-                if (index >= from) doomed.push_back(member);
-                index++;
+            for (int64_t rank = from; rank < to; rank++) {
+                doomed.push_back(ordered[static_cast<size_t>(rank)].second);
             }
         }
 
         for (const auto& member : doomed) {
             auto score = slot.zsetScores.find(member);
             if (score == slot.zsetScores.end()) continue;
-            auto range = slot.zsetByScore.equal_range(score->second);
-            for (auto sit = range.first; sit != range.second; ++sit) {
-                if (sit->second == member) {
-                    slot.zsetByScore.erase(sit);
-                    break;
-                }
-            }
+            eraseFromIndex(slot, score->second, member);
             slot.zsetScores.erase(score);
         }
         if (slot.zsetScores.empty()) data.erase(it);
@@ -334,13 +360,12 @@ void registerZsetCommands(CommandRegistry& r) {
             if (it->second.type != DataType::ZSET) return resp::error(kWrongTypeError);
             if (it->second.zsetScores.count(ctx[2]) == 0) return resp::nullBulk();
 
-            const int64_t cardinality = static_cast<int64_t>(it->second.zsetByScore.size());
-            int64_t rank = 0;
-            for (const auto& [score, member] : it->second.zsetByScore) {
-                if (member == ctx[2]) {
+            const OrderedMembers ordered = orderedByScore(it->second);
+            const int64_t cardinality = static_cast<int64_t>(ordered.size());
+            for (int64_t rank = 0; rank < cardinality; rank++) {
+                if (ordered[static_cast<size_t>(rank)].second == ctx[2]) {
                     return resp::integer(reverse ? cardinality - 1 - rank : rank);
                 }
-                rank++;
             }
             return resp::nullBulk();
         });
@@ -404,13 +429,7 @@ void registerZsetCommands(CommandRegistry& r) {
             for (size_t i = 2; i < ctx.size(); i++) {
                 auto score = it->second.zsetScores.find(ctx[i]);
                 if (score == it->second.zsetScores.end()) continue;
-                auto range = it->second.zsetByScore.equal_range(score->second);
-                for (auto sit = range.first; sit != range.second; ++sit) {
-                    if (sit->second == ctx[i]) {
-                        it->second.zsetByScore.erase(sit);
-                        break;
-                    }
-                }
+                eraseFromIndex(it->second, score->second, ctx[i]);
                 it->second.zsetScores.erase(score);
                 removed++;
             }
@@ -441,13 +460,7 @@ void registerZsetCommands(CommandRegistry& r) {
             auto existing = slot.zsetScores.find(member);
             if (existing != slot.zsetScores.end()) {
                 score = existing->second + delta;
-                auto range = slot.zsetByScore.equal_range(existing->second);
-                for (auto sit = range.first; sit != range.second; ++sit) {
-                    if (sit->second == member) {
-                        slot.zsetByScore.erase(sit);
-                        break;
-                    }
-                }
+                eraseFromIndex(slot, existing->second, member);
             }
             slot.zsetScores[member] = score;
             slot.zsetByScore.insert({score, member});
@@ -472,8 +485,10 @@ void registerZsetCommands(CommandRegistry& r) {
                 if (it->second.type != DataType::ZSET) return resp::error(kWrongTypeError);
                 RedisValue& slot = it->second;
 
-                std::vector<std::pair<double, std::string>> ordered(
-                    slot.zsetByScore.begin(), slot.zsetByScore.end());
+                OrderedMembers ordered = orderedByScore(slot);
+                // The last element of the canonical order is the largest score,
+                // and among tied scores the largest member -- which is what
+                // ZPOPMAX has to hand back first.
                 if (!smallest) std::reverse(ordered.begin(), ordered.end());
                 const size_t take = std::min<size_t>(static_cast<size_t>(std::max<int64_t>(want, 0)),
                                                      ordered.size());
@@ -485,13 +500,7 @@ void registerZsetCommands(CommandRegistry& r) {
                     if (score != slot.zsetScores.end()) slot.zsetScores.erase(score);
                 }
                 for (size_t i = 0; i < take; i++) {
-                    auto range = slot.zsetByScore.equal_range(ordered[i].first);
-                    for (auto sit = range.first; sit != range.second; ++sit) {
-                        if (sit->second == ordered[i].second) {
-                            slot.zsetByScore.erase(sit);
-                            break;
-                        }
-                    }
+                    eraseFromIndex(slot, ordered[i].first, ordered[i].second);
                 }
                 if (slot.zsetScores.empty()) data.erase(it);
                 return resp::array(out);
