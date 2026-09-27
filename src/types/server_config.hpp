@@ -25,6 +25,12 @@ struct ServerConfig {
     bool appendonly = false;
     std::string appendfilename = "appendonly.aof";
     std::string appenddirname = "appendonlydir";
+    // Redis accepts always/everysec/no. This server writes every command
+    // immediately and fsyncs on close and on rewrite, which is `everysec`
+    // behaviour in the sense that matters here: a crash can lose at most the
+    // tail, never a whole file. Reported verbatim by CONFIG GET, so it must
+    // reflect the policy actually in force.
+    std::string appendfsync = "everysec";
 
     // Auth
     std::string requirepass;

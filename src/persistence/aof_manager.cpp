@@ -22,18 +22,31 @@ namespace redis {
 
 namespace {
 
-constexpr const char* kManifestName = "appendonly.aof.manifest";
-constexpr const char* kBasePart = "appendonly.aof.1.base.rdb";
-constexpr const char* kIncrPart = "appendonly.aof.1.incr.aof";
+constexpr const char* kManifestSuffix = ".manifest";
+constexpr const char* kBaseSuffix = ".base.rdb";
+constexpr const char* kIncrSuffix = ".incr.aof";
 
 }  // namespace
 
 std::string AofManager::dirPath() const {
     return config_->dir + "/" + config_->appenddirname;
 }
-std::string AofManager::manifestPath() const { return dirPath() + "/" + kManifestName; }
-std::string AofManager::basePath() const { return dirPath() + "/" + kBasePart; }
-std::string AofManager::incrPath() const { return dirPath() + "/" + kIncrPart; }
+
+// Every part name derives from `appendfilename`, exactly as Redis does:
+//   <appendfilename>.manifest
+//   <appendfilename>.<seq>.base.rdb
+//   <appendfilename>.<seq>.incr.aof
+// Hardcoding "appendonly.aof" here made the server ignore --appendfilename,
+// so it went looking for a file nobody had asked it to create.
+std::string AofManager::manifestPath() const {
+    return dirPath() + "/" + config_->appendfilename + kManifestSuffix;
+}
+std::string AofManager::basePath() const {
+    return dirPath() + "/" + config_->appendfilename + ".1" + kBaseSuffix;
+}
+std::string AofManager::incrPath() const {
+    return dirPath() + "/" + config_->appendfilename + ".1" + kIncrSuffix;
+}
 
 bool AofManager::isOpen() const {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -112,8 +125,13 @@ bool AofManager::writeManifest(std::string& error) const {
         error = "cannot open " + manifestPath() + " for writing";
         return false;
     }
-    out << "file " << kBasePart << " seq 1 type b\n";
-    out << "file " << kIncrPart << " seq 1 type i\n";
+    // The manifest names parts relative to the AOF directory, so each entry is
+    // the full part file name - <appendfilename>.<seq>.<kind>, not just the
+    // suffix. A reader that joins the directory with ".incr.aof" ends up
+    // looking for a file that does not exist.
+    const std::string stem = config_->appendfilename + ".1";
+    out << "file " << stem << kBaseSuffix << " seq 1 type b\n";
+    out << "file " << stem << kIncrSuffix << " seq 1 type i\n";
     if (!out.good()) {
         error = "write to " + manifestPath() + " failed";
         return false;
@@ -127,7 +145,7 @@ bool AofManager::writeFreshBase(DataStore& store, std::string& error) const {
     // inside the appendonly directory. Delegating to RdbManager::save() would
     // write it to <dir>/<dbfilename> instead, where nothing would ever look
     // for it.
-    const std::string target = dirPath() + "/" + kBasePart;
+    const std::string target = basePath();
     try {
         std::filesystem::create_directories(dirPath());
         std::ofstream out(target, std::ios::binary | std::ios::trunc);
@@ -188,7 +206,7 @@ bool AofManager::open(DataStore& store, std::string& error) {
         // incremental part empty.
         if (!writeFreshBase(store, error)) return false;
         if (!writeManifest(error)) return false;
-        parts = {kBasePart, kIncrPart};
+        parts = {kBaseSuffix, kIncrSuffix};
     }
 
     // The base has to be applied before the incremental part, because the
@@ -276,9 +294,9 @@ bool AofManager::rewrite(DataStore& store, std::string& error) {
     }
     const int64_t nextSequence = highest + 1;
     const std::string baseName =
-        "appendonly.aof." + std::to_string(nextSequence) + ".base.rdb";
+        config_->appendfilename + "." + std::to_string(nextSequence) + kBaseSuffix;
     const std::string incrName =
-        "appendonly.aof." + std::to_string(nextSequence) + ".incr.aof";
+        config_->appendfilename + "." + std::to_string(nextSequence) + kIncrSuffix;
 
     rdb::RdbWriter writer;
     for (const auto& [key, value] : store.snapshot()) writer.writeEntry(key, value);

@@ -304,6 +304,7 @@ void registerGeoCommands(CommandRegistry& r) {
         }
 
         std::vector<std::string> out;
+        const bool hasExtras = withDist || withHash || withCoord;
         for (const auto& hit : hits) {
             std::vector<std::string> fields;
             fields.push_back(resp::bulkString(hit.member));
@@ -318,7 +319,10 @@ void registerGeoCommands(CommandRegistry& r) {
                 fields.push_back(resp::array({resp::bulkString(strutil::formatScore(hit.lon)),
                                               resp::bulkString(strutil::formatScore(hit.lat))}));
             }
-            out.push_back(resp::array(fields));
+            // Redis returns a flat array of member names when no WITH* option is
+            // given, and one nested array per hit when one is. Wrapping
+            // unconditionally made a plain GEOSEARCH answer [[member]].
+            out.push_back(hasExtras ? resp::array(fields) : fields[0]);
         }
         return resp::array(out);
     };

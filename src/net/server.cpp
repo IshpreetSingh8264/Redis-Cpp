@@ -165,6 +165,16 @@ bool RedisServer::parseArguments(int argc, char** argv, ServerConfig& config) {
         } else if (arg == "--appenddirname") {
             if (!next()) return false;
             config.appenddirname = value;
+        } else if (arg == "--appendfsync") {
+            if (!next()) return false;
+            const std::string policy = strutil::toLower(value);
+            if (policy != "always" && policy != "everysec" && policy != "no") {
+                std::cerr << "Bad argument for --appendfsync: " << value << std::endl;
+                return false;
+            }
+            // Accepted and recorded so CONFIG GET can report it. Only the
+            // everysec-equivalent policy is reachable today - see ServerConfig.
+            config.appendfsync = policy;
         } else if (arg == "--requirepass") {
             if (!next()) return false;
             config.requirepass = value;
@@ -447,9 +457,12 @@ std::string RedisServer::execute(const std::vector<std::string>& args, ClientSes
     }
 
     if (session.subscribed() && !fromMaster && !allowedWhileSubscribed(name)) {
-        return resp::array({resp::error("ERR Can't execute '" + strutil::toLower(name) +
-                                        "': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / "
-                                        "QUIT / RESET are allowed in this context")});
+        // A plain error, not a one-element array. Real redis 7.2 answers
+        // `-ERR Can't execute 'set': ...` here; wrapping the error in an array
+        // makes the client see an array and treat the command as having run.
+        return resp::error("ERR Can't execute '" + strutil::toLower(name) +
+                           "': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / "
+                           "QUIT / RESET are allowed in this context");
     }
 
     if (session.inMulti() && !fromMaster && nonQueuableCommands().count(name) == 0) {

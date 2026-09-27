@@ -44,8 +44,11 @@ bool decode(uint64_t score, double& lon, double& lat) {
         lonIndex = (lonIndex << 1) | ((score >> (2 * bit + 1)) & 1ULL);
         latIndex = (latIndex << 1) | ((score >> (2 * bit)) & 1ULL);
     }
-    lon = kLonMin + (static_cast<double>(lonIndex) / limit) * (kLonMax - kLonMin);
-    lat = kLatMin + (static_cast<double>(latIndex) / limit) * (kLatMax - kLatMin);
+    // The index is the cell's LOWER edge. Redis reports the cell CENTRE, so add
+    // half a cell before mapping back, or every decoded coordinate is off by one
+    // least-significant bit (~2.7e-6 deg lon, ~1.3e-6 deg lat).
+    lon = kLonMin + ((static_cast<double>(lonIndex) + 0.5) / limit) * (kLonMax - kLonMin);
+    lat = kLatMin + ((static_cast<double>(latIndex) + 0.5) / limit) * (kLatMax - kLatMin);
     return true;
 }
 

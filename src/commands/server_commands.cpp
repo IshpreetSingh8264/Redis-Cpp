@@ -130,13 +130,12 @@ std::string configGet(CommandContext& ctx, const std::vector<std::string>& param
     }
     if (matches("dbfilename")) add("dbfilename", config.dbfilename);
     if (matches("appendfsync")) {
-        // This AOF writes every command to the incremental part immediately and
-        // fsyncs on close and on rewrite; it never fsyncs per command, so it is
-        // not `always` and it is not `noappend`. `everysec` is the Redis word
-        // for "the OS decides when the bytes reach the platter", which is what
-        // this is. --appendfsync is not parsed, so it is also the only policy
-        // the server can currently be in.
-        add("appendfsync", "everysec");
+        // Report the policy actually in force, not a constant. This AOF writes
+        // every command to the incremental part immediately and fsyncs on close
+        // and on rewrite, so `everysec` is the honest default - but if the flag
+        // said otherwise, say that instead. A hardcoded value here would be a
+        // config that lies to CONFIG GET.
+        add("appendfsync", config.appendfsync);
     }
     if (matches("save")) add("save", "3600 1 300 100 60 10000");
     if (matches("port")) add("port", std::to_string(config.port));
@@ -153,6 +152,17 @@ std::string configGet(CommandContext& ctx, const std::vector<std::string>& param
 void registerServerCommands(CommandRegistry& r) {
     r["PING"] = [](CommandContext& ctx) {
         if (ctx.size() > 2) return wrongArity("ping");
+        // In subscribed mode the reply is a two-element array, ["pong", <count>],
+        // not a simple string - the count tells the client how many
+        // subscriptions it is still holding. Outside subscribed mode PING is an
+        // ordinary command and answers +PONG.
+        if (ctx.client != nullptr && ctx.client->subscribed()) {
+            // Subscribed mode answers ["pong", <message>] in RESP2 - two
+            // elements, and the second is the message (empty for a bare PING).
+            // The subscription count only appears in RESP3.
+            return resp::array({resp::bulkString("pong"),
+                                resp::bulkString(ctx.size() == 2 ? ctx[1] : "")});
+        }
         if (ctx.size() == 2) return resp::bulkString(ctx[1]);
         return resp::simpleString("PONG");
     };
