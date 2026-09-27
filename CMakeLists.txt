@@ -20,4 +20,8 @@ find_package(Threads REQUIRED)
 
 add_executable(redis ${SOURCE_FILES})
 
+# Headers are included by their path from src/, so that the include graph reads
+# the same way as the directory tree.
+target_include_directories(redis PRIVATE src)
+
 target_link_libraries(redis PRIVATE Threads::Threads)
