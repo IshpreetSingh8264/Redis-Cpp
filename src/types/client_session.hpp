@@ -65,9 +65,17 @@ public:
     const std::string& name() const { return name_; }
 
     // --- replication side (replication/ owns these) ---------------------
-    /// True when this connection *is* the upstream master link on a replica.
+    /// This connection is our upstream master (we are the replica).
     void markMasterLink() { masterLink_ = true; }
     bool isMasterLink() const { return masterLink_; }
+    /// This connection is a downstream replica (we are the master). Marked
+    /// once PSYNC has succeeded, which is also the point after which nothing
+    /// on this socket may be answered: a reply is not replication traffic, and
+    /// a replica that counted one would drift out of step with the master's
+    /// offset.
+    void markReplicaLink() { replicaLink_ = true; }
+    bool isReplicaLink() const { return replicaLink_; }
+    bool isReplicationLink() const { return masterLink_ || replicaLink_; }
     /// Offset this replica has acknowledged to its master, used by WAIT.
     void setAckedOffset(int64_t off) { ackedOffset_ = off; }
     int64_t ackedOffset() const { return ackedOffset_; }
@@ -83,6 +91,7 @@ private:
     std::string user_ = "default";
     std::string name_;
     bool masterLink_ = false;
+    bool replicaLink_ = false;
     int64_t ackedOffset_ = 0;
 };
 

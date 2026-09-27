@@ -88,17 +88,30 @@ void registerReplicationCommands(CommandRegistry& r) {
         // Everything below writes to the socket directly: the reply is a
         // simple string, then a bulk RDB, then the connection becomes a
         // replication stream with no further framing on our side.
-        io::sendAll(ctx.fd(),
-                    resp::simpleString("+FULLRESYNC " + replication->replid() + " " +
-                                       std::to_string(replication->offset())));
+        // resp::simpleString adds the '+' itself; including one in the text
+        // produced "++FULLRESYNC", which no replica could parse, so the sync
+        // never completed and the link sat at "down" forever.
+        io::sendAll(ctx.fd(), resp::simpleString("FULLRESYNC " + replication->replid() + " " +
+                                                 std::to_string(replication->offset())));
 
         rdb::RdbWriter writer;
         for (const auto& [key, value] : ctx.services->store->snapshot()) {
             writer.writeEntry(key, value);
         }
-        io::sendAll(ctx.fd(), resp::bulkString(writer.finish()));
+        const std::string dump = writer.finish();
+
+        // The dump goes out as a bulk string *header* plus exactly the payload,
+        // with no trailing CRLF. resp::bulkString() appends one, which put two
+        // phantom bytes at the end of the stream: the replica parsed them as an
+        // empty command and its offset ended up permanently two ahead of the
+        // master's.
+        io::sendAll(ctx.fd(), "$" + std::to_string(dump.size()) + "\r\n" + dump);
 
         replication->addReplica(ctx.fd(), replication->offset());
+        // From here on this socket carries replication traffic only. The
+        // dispatcher stops answering it, so the replica never has to
+        // distinguish a command reply from a propagated command.
+        ctx.client->markReplicaLink();
         return "";  // already answered
     };
 

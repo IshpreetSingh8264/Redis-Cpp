@@ -175,11 +175,26 @@ bool RedisServer::parseArguments(int argc, char** argv, ServerConfig& config) {
             if (!next()) return false;
             config.user = value;
         } else if (arg == "--replicaof" || arg == "--slaveof") {
+            // Two spellings are in the wild: Redis's own `--replicaof host port`
+            // and the quoted `--replicaof "host port"` the CodeCrafters harness
+            // uses. Requiring the two-argument form and rejecting the other one
+            // made the process exit with a usage error, so the replica never
+            // came up at all.
             std::string host, portText;
-            if (i + 2 >= argc) return false;
-            host = argv[++i];
-            portText = argv[++i];
-            if (!strutil::parseInt64(portText, number)) {
+            if (i + 1 >= argc) return false;
+            const std::string first = argv[i + 1];
+            const size_t space = first.find_first_of(" \t");
+            if (space != std::string::npos) {
+                host = first.substr(0, space);
+                portText = first.substr(space + 1);
+                i += 1;
+            } else {
+                if (i + 2 >= argc) return false;
+                host = first;
+                portText = argv[i + 2];
+                i += 2;
+            }
+            if (!strutil::parseInt64(portText, number) || number <= 0 || number > 65535) {
                 std::cerr << "Bad replicaof port: " << portText << std::endl;
                 return false;
             }
@@ -335,7 +350,12 @@ void RedisServer::handleReadable(int fd) {
     }
     const std::string bytes(buffer, static_cast<size_t>(n));
 
-    if (replication_.isMasterLink(fd)) {
+    // The replication socket carries a command stream in one direction only:
+    // the replica reads its master's full-resync and command stream from it,
+    // while the master reads its replicas' PING / REPLCONF / PSYNC from it.
+    // Routing both ends through the replica-side parser meant a master never
+    // answered a replica's PSYNC, so no replica ever finished its handshake.
+    if (config_.isReplica && replication_.isMasterLink(fd)) {
         replication_.feedMaster(bytes);
         return;
     }
@@ -402,7 +422,9 @@ std::string RedisServer::execute(const std::vector<std::string>& args, ClientSes
         return resp::error("ERR unknown command '" + name + "'");
     }
 
-    const bool fromMaster = session.isMasterLink();
+    // "fromMaster" means the command arrived over the replication link in
+    // either direction, so the same exemptions apply to both ends.
+    const bool fromMaster = session.isReplicationLink();
 
     // Auth, except for the handful of commands a client must be able to send
     // before it can authenticate.
@@ -443,6 +465,12 @@ std::string RedisServer::execute(const std::vector<std::string>& args, ClientSes
     // stream, so stop here.
     if (reply.empty()) return reply;
 
+    // Never answer a replica. Only the master speaks on that socket, and a
+    // "+OK" in the middle of a replication stream is a frame the replica's
+    // offset would then count, so the two offsets would drift apart by
+    // whatever the reply happened to be.
+    if (session.isReplicaLink()) return "";
+
     if (!fromMaster && isWriteCommand(name)) {
         if (aof_) aof_->append(args);
         if (!config_.isReplica) replication_.propagate(args);
@@ -472,6 +500,13 @@ void RedisServer::closeConnection(int fd) {
 
 void RedisServer::tick() {
     blocked_.expireTimedOut();
+
+    // A handshake that failed mid-flight reports itself once, rather than
+    // leaving `master_link_status:down` with nothing to say why.
+    if (config_.isReplica && !linkErrorReported_ && !replication_.lastError().empty()) {
+        std::cerr << "Warning: replication link: " << replication_.lastError() << std::endl;
+        linkErrorReported_ = true;
+    }
 
     const std::vector<std::string> expired = store_.collectExpired();
     if (!expired.empty()) store_.removeKeys(expired);

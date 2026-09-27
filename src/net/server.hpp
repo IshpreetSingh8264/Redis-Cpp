@@ -73,6 +73,7 @@ private:
     bool stopping_ = false;
     bool masterLinkRegistered_ = false;
     int64_t lastResyncAttemptMs_ = 0;
+    bool linkErrorReported_ = false;
 };
 
 }  // namespace redis

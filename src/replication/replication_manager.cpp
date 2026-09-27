@@ -199,25 +199,37 @@ bool ReplicationManager::startReplica() {
 }
 
 bool ReplicationManager::connectToMaster() {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return false;
+    // Resolve rather than inet_pton: --replicaof is given "localhost" as often
+    // as it is given "127.0.0.1", and inet_pton rejects anything that is not
+    // four dotted numbers.
+    struct addrinfo hints;
+    std::memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
 
-    struct sockaddr_in addr;
-    std::memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(static_cast<uint16_t>(config_->masterPort));
-    if (inet_pton(AF_INET, config_->masterHost.c_str(), &addr.sin_addr) != 1) {
-        ::close(fd);
-        fail("master host '" + config_->masterHost + "' is not an IP address");
+    const std::string portText = std::to_string(config_->masterPort);
+    struct addrinfo* resolved = nullptr;
+    const int rc = ::getaddrinfo(config_->masterHost.c_str(), portText.c_str(), &hints, &resolved);
+    if (rc != 0 || resolved == nullptr) {
+        fail("cannot resolve master '" + config_->masterHost + "': " + gai_strerror(rc));
         return false;
     }
 
-    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
-        fail("cannot connect to master " + config_->masterHost + ":" +
-             std::to_string(config_->masterPort) + ": " + std::strerror(errno));
-        ::close(fd);
+    const int fd = ::socket(resolved->ai_family, resolved->ai_socktype, resolved->ai_protocol);
+    if (fd < 0) {
+        const std::string why = std::strerror(errno);
+        ::freeaddrinfo(resolved);
+        fail("cannot create the master socket: " + why);
         return false;
     }
+    if (::connect(fd, resolved->ai_addr, resolved->ai_addrlen) != 0) {
+        const std::string why = std::strerror(errno);
+        fail("cannot connect to master " + config_->masterHost + ":" + portText + ": " + why);
+        ::close(fd);
+        ::freeaddrinfo(resolved);
+        return false;
+    }
+    ::freeaddrinfo(resolved);
 
     fcntl(fd, F_SETFL, O_NONBLOCK);
     masterFd_ = fd;
@@ -315,9 +327,9 @@ void ReplicationManager::rdbLoadFromMaster(const std::string& blob) {
 }
 
 void ReplicationManager::ackCurrentOffset() {
-    const int64_t now = timeutil::steadyMs();
-    if (now - lastAckSentAt_ < 100) return;  // at most 10 REPLCONF ACKs a second
-    lastAckSentAt_ = now;
+    // Acknowledge after every applied command rather than on a timer. WAIT
+    // blocks on these, and a timer that swallows the ack after a single write
+    // is what made `WAIT 1 1000` answer 0 on a fully caught-up replica.
     io::sendAll(masterFd_, ackFrame());
 }
 
@@ -415,10 +427,16 @@ void ReplicationManager::stepHandshake() {
         }
 
         if (state_ == HandshakeState::AWAITING_FULLRESYNC) {
-            // The dump arrives as a RESP bulk string: "$<len>\r\n<payload>".
-            size_t headerEnd = inbound_.find("\r\n");
+            // The dump arrives as one RESP bulk string: "$<len>\r\n<payload>".
+            // The header is consumed here and only the payload is left for
+            // LOADING_RDB, so exactly one state owns each byte. Letting the
+            // two states overlap -- one branch taking the whole payload at
+            // once, the other draining it -- meant pendingRdbExpected_ was
+            // still 0 when the payload had already arrived, and the
+            // "remaining = expected - have" subtraction underflowed.
+            const size_t headerEnd = inbound_.find("\r\n");
             if (headerEnd == std::string::npos) return;
-            if (inbound_.empty() || inbound_[0] != '$') {
+            if (inbound_[0] != '$') {
                 fail("expected a bulk RDB payload from master");
                 return;
             }
@@ -427,44 +445,24 @@ void ReplicationManager::stepHandshake() {
                 fail("master sent an unparseable RDB length");
                 return;
             }
-            if (inbound_.size() < headerEnd + 2 + static_cast<size_t>(len)) {
-                pendingRdbExpected_ = static_cast<size_t>(len);
-                state_ = HandshakeState::LOADING_RDB;
-                return;
-            }
-            pendingRdb_ = inbound_.substr(headerEnd + 2, static_cast<size_t>(len));
-            inbound_.erase(0, headerEnd + 2 + static_cast<size_t>(len));
+            inbound_.erase(0, headerEnd + 2);
+            pendingRdbExpected_ = static_cast<size_t>(len);
+            pendingRdb_.clear();
             state_ = HandshakeState::LOADING_RDB;
-            continue;
+            continue;  // fall through into the loader
         }
 
         if (state_ == HandshakeState::LOADING_RDB) {
-            size_t headerEnd = inbound_.find("\r\n");
-            size_t already = pendingRdb_.size();
-            size_t headerLen = headerEnd == std::string::npos ? 0 : headerEnd + 2;
-            if (pendingRdbExpected_ == 0 && headerEnd != std::string::npos) {
-                int64_t len = 0;
-                if (!strutil::parseInt64(inbound_.substr(1, headerEnd - 1), len) || len < 0) {
-                    fail("master sent an unparseable RDB length");
-                    return;
-                }
-                pendingRdbExpected_ = static_cast<size_t>(len);
-                pendingRdb_.clear();
-                already = 0;
-                headerLen = headerEnd + 2;
-            }
-            size_t want = pendingRdbExpected_ - already;
-            size_t take = std::min(want, inbound_.size());
+            const size_t take =
+                std::min(pendingRdbExpected_ - pendingRdb_.size(), inbound_.size());
             pendingRdb_.append(inbound_, 0, take);
             inbound_.erase(0, take);
             if (pendingRdb_.size() < pendingRdbExpected_) return;
 
             // Hand the dump to the RDB layer. The offset stays where the
             // FULLRESYNC line put it; the dump itself is not replication
-            // traffic.
-            if (services_ && services_->rdb) {
-                rdbLoadFromMaster(pendingRdb_);
-            }
+            // traffic, so it must not be counted against the offset.
+            rdbLoadFromMaster(pendingRdb_);
             pendingRdb_.clear();
             pendingRdbExpected_ = 0;
             state_ = HandshakeState::STREAMING;

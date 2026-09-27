@@ -53,11 +53,9 @@ std::string buildInfo(CommandContext& ctx) {
     if (rdb) ss << "rdb_filename:" << ctx.services->config->dbfilename << "\r\n";
     ss << "rdb_changes_since_last_save:0\r\n";
 
-    ss << "# Replication\r\n";
-    if (ctx.services->replication) {
-        const std::string replication = ctx.services->replication->infoReplication();
-        ss << replication.substr(2);  // drop the "# Replication\r\n" header
-    }
+    // The replication section comes with its own "# Replication" header, which
+    // this INFO adds itself; splicing it in whole duplicated the header line.
+    if (ctx.services->replication) ss << ctx.services->replication->infoReplication();
 
     ss << "# Stats\r\n";
     ss << "total_connections_received:0\r\n";
