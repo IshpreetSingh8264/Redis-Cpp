@@ -337,6 +337,30 @@ void RedisServer::handleReadable(int fd) {
         return;
     }
 
+    // The replication socket carries a command stream in one direction only:
+    // the replica reads its master's full-resync and command stream from it,
+    // while the master reads its replicas' PING / REPLCONF / PSYNC from it.
+    // Routing both ends through the replica-side parser meant a master never
+    // answered a replica's PSYNC, so no replica never finished its handshake.
+    //
+    // This is decided before any read, so that the link's death is handled
+    // here and cannot fall through to the generic client path.
+    if (config_.isReplica && replication_.isMasterLink(fd)) {
+        char buffer[16384];
+        const ssize_t n = ::read(fd, buffer, sizeof(buffer));
+        if (n > 0) {
+            replication_.feedMaster(std::string(buffer, static_cast<size_t>(n)));
+            return;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return;
+        epoll_ctl(epollFd_, EPOLL_CTL_DEL, fd, nullptr);
+        replication_.masterLinkClosed("the master closed the connection");
+        masterLinkRegistered_ = false;
+        if (masterSession_) masterSession_.reset();
+        std::cerr << "Warning: lost the master link, will resync" << std::endl;
+        return;
+    }
+
     char buffer[16384];
     const ssize_t n = ::read(fd, buffer, sizeof(buffer));
     if (n < 0) {
@@ -348,21 +372,10 @@ void RedisServer::handleReadable(int fd) {
         closeConnection(fd);
         return;
     }
-    const std::string bytes(buffer, static_cast<size_t>(n));
-
-    // The replication socket carries a command stream in one direction only:
-    // the replica reads its master's full-resync and command stream from it,
-    // while the master reads its replicas' PING / REPLCONF / PSYNC from it.
-    // Routing both ends through the replica-side parser meant a master never
-    // answered a replica's PSYNC, so no replica ever finished its handshake.
-    if (config_.isReplica && replication_.isMasterLink(fd)) {
-        replication_.feedMaster(bytes);
-        return;
-    }
 
     auto it = clients_.find(fd);
     if (it == clients_.end()) return;
-    it->second->inputBuffer() += bytes;
+    it->second->inputBuffer() += std::string(buffer, static_cast<size_t>(n));
     processInput(*it->second);
 }
 

@@ -105,6 +105,15 @@ public:
     /// the RDB payload, and the steady-state command stream.
     void feedMaster(const std::string& bytes);
 
+    /// The master link is gone. Releases the socket and resets the handshake
+    /// so the event loop can resync.
+    ///
+    /// This has to be the *only* way the link is released. Closing the socket
+    /// while leaving masterFd_ set is how a later accept() hands the same fd
+    /// number to an ordinary client, which then gets fed to the replica's
+    /// handshake parser instead of the command dispatcher.
+    void masterLinkClosed(const std::string& reason);
+
     // --- callbacks the net layer installs ---------------------------------
     /// Apply a command received from the master. Supplied by net/server.
     std::function<void(const std::vector<std::string>&)> applyFromMaster;

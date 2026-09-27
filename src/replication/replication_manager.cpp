@@ -333,6 +333,19 @@ void ReplicationManager::ackCurrentOffset() {
     io::sendAll(masterFd_, ackFrame());
 }
 
+void ReplicationManager::masterLinkClosed(const std::string& reason) {
+    const int released = masterFd_;
+    if (released >= 0) {
+        ::close(released);
+        masterFd_ = -1;  // before anything else can observe the stale number
+    }
+    inbound_.clear();
+    pendingRdb_.clear();
+    pendingRdbExpected_ = 0;
+    state_ = HandshakeState::PSYNC_SENT;
+    if (lastError_.empty()) lastError_ = reason;
+}
+
 void ReplicationManager::feedMaster(const std::string& bytes) {
     if (masterFd_ < 0) return;
     inbound_ += bytes;
