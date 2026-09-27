@@ -4,6 +4,12 @@
  * WATCH is optimistic locking. The net layer asks `watchedKeysChanged()` before
  * EXEC runs the queue, so the abort decision is made with the same lock the
  * writes took, rather than by polling a flag a writer might not have set yet.
+ *
+ * Redis words the two ways a transaction dies differently, and only one of
+ * them is modelled here: a violated watch makes EXEC answer with a null array,
+ * while a command that errored while being queued makes it answer EXECABORT.
+ * Modelling the second needs a per-client dirty flag that the net layer sets
+ * and nothing resets, so it is left alone rather than faked.
  */
 #include <algorithm>
 
@@ -144,7 +150,13 @@ void registerTransactionCommands(CommandRegistry& r) {
                 ctx.client->endMulti();
                 ctx.client->clearQueue();
                 ctx.client->clearWatched();
-                return resp::error("EXECABORT Transaction discarded because of previous errors.");
+                // A null array, not an error. Redis says "a watch you set was
+                // violated" with silence: the thing that did not happen is the
+                // caller's own queued commands, and the null array is how it
+                // says so. The EXECABORT error belongs to the other way a
+                // transaction dies -- a command that errored while being queued
+                // -- which is a different condition and not modelled here.
+                return resp::nullArray();
             }
         }
 
