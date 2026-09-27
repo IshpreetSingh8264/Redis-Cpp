@@ -38,6 +38,7 @@ private:
     bool readLength(uint64_t& out);
     bool readString(std::string& out);
     bool readUint(uint64_t& out, int bytes);
+    bool readLittleEndianUint(uint64_t& out, int bytes);
     bool readScoreAsString(double& out);
     bool readScoreAsDouble(double& out);
     bool readValue(uint8_t type, RedisValue& out);

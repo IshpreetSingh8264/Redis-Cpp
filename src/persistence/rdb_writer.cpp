@@ -26,6 +26,10 @@ void RdbWriter::putString(const std::string& s) {
     body_ += s;
 }
 
+void RdbWriter::putLittleEndianUint64(uint64_t v) {
+    for (int i = 0; i < 8; i++) putByte(static_cast<uint8_t>((v >> (i * 8)) & 0xFF));
+}
+
 void RdbWriter::putLittleEndianDouble(double d) {
     uint64_t bits = 0;
     std::memcpy(&bits, &d, sizeof(bits));
@@ -37,11 +41,13 @@ void RdbWriter::writeEntry(const std::string& key, const RedisValue& value) {
     if (value.isExpired(now)) return;  // nothing to persist
 
     // Expiry goes *before* the type byte and applies to exactly one key.
+    // The timestamp is the format's one little-endian field: redis stores it
+    // with memrev64ifbe() (see rdbSaveMillisecondTime) and reads it back the
+    // same way, so writing it big-endian would produce a file that only this
+    // build can load -- each side would cancel out the other's mistake.
     if (value.expiryMs >= 0) {
         putByte(OP_EXPIRETIME_MS);
-        for (int i = 7; i >= 0; i--) {
-            putByte(static_cast<uint8_t>((static_cast<uint64_t>(value.expiryMs) >> (i * 8)) & 0xFF));
-        }
+        putLittleEndianUint64(static_cast<uint64_t>(value.expiryMs));
     }
 
     switch (value.type) {

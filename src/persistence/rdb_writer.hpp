@@ -35,6 +35,7 @@ private:
     void putByte(uint8_t b);
     void putString(const std::string& s);
     void putLength(uint64_t n);
+    void putLittleEndianUint64(uint64_t v);
     void putLittleEndianDouble(double d);
 
     std::string body_;

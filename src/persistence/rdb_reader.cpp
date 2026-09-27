@@ -99,9 +99,33 @@ uint32_t RdbReader::peekVersion(const uint8_t* data, size_t size) {
 
 bool RdbReader::readUint(uint64_t& out, int bytes) {
     if (pos_ + static_cast<size_t>(bytes) > size_) return false;
-    // Big-endian, which is what every multi-byte integer in an RDB uses.
+    // Big-endian, which is what every multi-byte integer in an RDB uses --
+    // except the expiry timestamps, which are little-endian. See
+    // readLittleEndianUint.
     uint64_t v = 0;
     for (int i = 0; i < bytes; i++) v = (v << 8) | data_[pos_ + static_cast<size_t>(i)];
+    pos_ += static_cast<size_t>(bytes);
+    out = v;
+    return true;
+}
+
+/// The one multi-byte field in the RDB format that is *not* big-endian.
+///
+/// Both expiry opcodes carry an absolute unix timestamp, and redis writes it
+/// with `rdbSaveMillisecondTime()`, which does `memrev64ifbe(&t64)` before
+/// hitting the file -- "Store in little endian", in the source's own words.
+/// `rdbLoadTime()` reads the 4-byte seconds variant straight into an `int32_t`
+/// with no conversion at all, so on a little-endian host that is little-endian
+/// too.
+///
+/// (redis only byte-swaps on load for `rdbver >= 9`, i.e. Redis 5 and newer,
+/// because files written by older versions hold the *writer's* native order
+/// and a big-endian machine cannot guess it. On a little-endian host the two
+/// cases produce identical bytes, so one read is correct for both.)
+bool RdbReader::readLittleEndianUint(uint64_t& out, int bytes) {
+    if (pos_ + static_cast<size_t>(bytes) > size_) return false;
+    uint64_t v = 0;
+    for (int i = bytes - 1; i >= 0; i--) v = (v << 8) | data_[pos_ + static_cast<size_t>(i)];
     pos_ += static_cast<size_t>(bytes);
     out = v;
     return true;
@@ -416,13 +440,13 @@ bool RdbReader::load(Entries& out, std::string& error) {
             }
             case OP_EXPIRETIME: {
                 uint64_t secs = 0;
-                if (!readUint(secs, 4)) { error = "truncated EXPIRETIME"; return false; }
+                if (!readLittleEndianUint(secs, 4)) { error = "truncated EXPIRETIME"; return false; }
                 pendingExpiryMs_ = static_cast<int64_t>(secs) * 1000;
                 continue;
             }
             case OP_EXPIRETIME_MS: {
                 uint64_t ms = 0;
-                if (!readUint(ms, 8)) { error = "truncated EXPIRETIME_MS"; return false; }
+                if (!readLittleEndianUint(ms, 8)) { error = "truncated EXPIRETIME_MS"; return false; }
                 pendingExpiryMs_ = static_cast<int64_t>(ms);
                 continue;
             }
@@ -447,10 +471,12 @@ bool RdbReader::load(Entries& out, std::string& error) {
         }
 
         if (pendingExpiryMs_ >= 0) {
-            if (pendingExpiryMs_ <= now) {
-                // Already dead by the time we read it -- drop it, as Redis does.
+            // redis drops the key when `expiretime < now` -- see rdbLoadRio()'s
+            // `iAmMaster() && ... && expiretime < now` branch. Strictly less
+            // than, so a key whose deadline is exactly `now` still loads.
+            if (pendingExpiryMs_ < now) {
                 pendingExpiryMs_ = -1;
-                continue;
+                continue;  // already dead -- drop it, as Redis does
             }
             value.expiryMs = pendingExpiryMs_;
         }
