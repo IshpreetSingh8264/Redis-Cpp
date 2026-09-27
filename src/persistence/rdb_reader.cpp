@@ -9,6 +9,16 @@ namespace redis::rdb {
 
 namespace {
 
+/// Two lowercase hex digits. Used in the diagnostics, where a decimal number
+/// printed after an "0x" reads as a completely different byte.
+std::string toHex(uint8_t byte) {
+    static const char* digits = "0123456789abcdef";
+    std::string out = "00";
+    out[0] = digits[(byte >> 4) & 0x0F];
+    out[1] = digits[byte & 0x0F];
+    return out;
+}
+
 /// LZF decompression, as used inside RDB string payloads.
 ///
 /// A control byte whose upper 3 bits select a literal run (7) or a
@@ -97,10 +107,17 @@ bool RdbReader::readUint(uint64_t& out, int bytes) {
     return true;
 }
 
+/// A collection's cardinality: 6-, 14- or 32-bit, with the two top bits set
+/// meaning the value is literally 0, 1 or 2.
+///
+/// The same byte values mean something else entirely in a *string* position --
+/// see readString -- which is why the two are separate functions and not one
+/// with a flag. Sharing them is what made an RDB written by a real
+/// redis-server fail to parse.
 bool RdbReader::readLength(uint64_t& out) {
     if (pos_ >= size_) return false;
-    uint8_t first = data_[pos_++];
-    uint8_t kind = (first >> 6) & 0x03;
+    const uint8_t first = data_[pos_++];
+    const uint8_t kind = (first >> 6) & 0x03;
     if (kind == LEN_6BIT) {
         out = first & 0x3F;
         return true;
@@ -111,53 +128,57 @@ bool RdbReader::readLength(uint64_t& out) {
         return true;
     }
     if (kind == LEN_32BIT) return readUint(out, 4);
-
-    uint8_t spec = first & 0x3F;
-    if (spec == SPECIAL_ZERO) { out = 0; return true; }
-    if (spec == SPECIAL_ONE) { out = 1; return true; }
-    if (spec == SPECIAL_TWO) { out = 2; return true; }
-
-    if (spec == SPECIAL_ENC_STR) {
-        if (pos_ >= size_) return false;
-        int bytes;
-        switch (data_[pos_++]) {
-            case 0: bytes = 1; break;  // int8
-            case 1: bytes = 2; break;  // int16
-            case 2: bytes = 4; break;  // int32
-            default: return false;
-        }
-        uint64_t raw = 0;
-        if (!readUint(raw, bytes)) return false;
-        int bits = bytes * 8;
-        if (raw & (1ULL << (bits - 1))) raw |= ~0ULL << bits;  // sign extend
-        out = raw;
-        return true;
-    }
-
-    if (spec == SPECIAL_LZF) {
-        uint64_t compressedLen = 0, uncompressedLen = 0;
-        if (!readLength(compressedLen) || !readLength(uncompressedLen)) return false;
-        if (compressedLen > size_ - pos_) return false;
-        std::string decoded;
-        if (!lzfDecompress(data_ + pos_, static_cast<size_t>(compressedLen),
-                           static_cast<size_t>(uncompressedLen), decoded)) {
-            return false;
-        }
-        pos_ += static_cast<size_t>(compressedLen);
-        // The decoded bytes are not in the buffer, so park them for readString.
-        lzfPending_ = std::move(decoded);
-        out = static_cast<uint64_t>(decoded.size());
-        return true;
+    if (kind == LEN_SPECIAL) {
+        out = first & 0x3F;  // 0, 1 or 2
+        return out <= SPECIAL_TWO;
     }
     return false;
 }
 
+/// A string payload. The 0b11 prefix selects an encoding rather than a length:
+/// 0/1/2 are an int8/int16/int32 stored in native (little-endian) order with
+/// **no width byte**, and 3 is LZF.
 bool RdbReader::readString(std::string& out) {
     if (!lzfPending_.empty()) {
         out = std::move(lzfPending_);
         lzfPending_.clear();
         return true;
     }
+    if (pos_ >= size_) return false;
+
+    const uint8_t first = data_[pos_];
+    if (((first >> 6) & 0x03) == LEN_SPECIAL) {
+        const uint8_t encop = first & 0x3F;
+        pos_++;
+
+        if (encop == SPECIAL_LZF) {
+            uint64_t compressedLen = 0, uncompressedLen = 0;
+            if (!readLength(compressedLen) || !readLength(uncompressedLen)) return false;
+            if (compressedLen > size_ - pos_) return false;
+            if (!lzfDecompress(data_ + pos_, static_cast<size_t>(compressedLen),
+                               static_cast<size_t>(uncompressedLen), out)) {
+                return false;
+            }
+            pos_ += static_cast<size_t>(compressedLen);
+            return true;
+        }
+
+        // int8 / int16 / int32. The sub-code is the width -- 1, 2 and 4 bytes
+        // respectively, not 1, 2 and 3 -- there is no separate width byte, and
+        // the bytes are native order, the opposite of every other multi-byte
+        // field in the format.
+        if (encop > SPECIAL_ENC_INT32) return false;
+        const int bytes = 1 << encop;
+        if (pos_ + static_cast<size_t>(bytes) > size_) return false;
+        uint64_t raw = 0;
+        for (int i = bytes - 1; i >= 0; i--) raw = (raw << 8) | data_[pos_ + static_cast<size_t>(i)];
+        pos_ += static_cast<size_t>(bytes);
+        const int bits = bytes * 8;
+        if (raw & (1ULL << (bits - 1))) raw |= ~0ULL << bits;  // sign extend
+        out = std::to_string(static_cast<int64_t>(raw));
+        return true;
+    }
+
     uint64_t len = 0;
     if (!readLength(len)) return false;
     if (len > size_ - pos_) return false;
@@ -167,13 +188,14 @@ bool RdbReader::readString(std::string& out) {
 }
 
 bool RdbReader::readScoreAsString(double& out) {
-    // RDB_TYPE_ZSET: the score is a length-prefixed 8-byte little-endian
-    // IEEE754 bit pattern.
-    std::string raw;
-    if (!readString(raw) || raw.size() != 8) return false;
-    uint64_t bits = 0;
-    for (int i = 7; i >= 0; i--) bits = (bits << 8) | static_cast<uint8_t>(raw[static_cast<size_t>(i)]);
-    std::memcpy(&out, &bits, sizeof(out));
+    // RDB_TYPE_ZSET is the pre-2.6 spelling of RDB_TYPE_ZSET_2, and redis has
+    // always written the score the same way in both: eight raw bytes holding
+    // the IEEE754 bit pattern in the machine's native order. The only
+    // difference between the two type bytes is which encoding the *members*
+    // were in when the file was written.
+    if (pos_ + 8 > size_) return false;
+    std::memcpy(&out, data_ + pos_, sizeof(out));
+    pos_ += 8;
     return true;
 }
 
@@ -409,13 +431,18 @@ bool RdbReader::load(Entries& out, std::string& error) {
         }
 
         // Everything else is a value type byte introducing a key.
+        const size_t startOfEntry = pos_ - 1;
         std::string key;
-        if (!readString(key)) { error = "truncated key"; return false; }
+        if (!readString(key)) {
+            error = "truncated key at file offset " + std::to_string(pos_ - 1) +
+                    " (type byte 0x" + toHex(opcode) + ")";
+            return false;
+        }
 
         RedisValue value;
         if (!readValue(opcode, value)) {
             error = "key '" + key + "': unsupported or corrupt encoding, type byte 0x" +
-                    std::to_string(static_cast<int>(opcode));
+                    toHex(opcode) + " at file offset " + std::to_string(startOfEntry);
             return false;
         }
 
