@@ -92,15 +92,17 @@ void registerGeoCommands(CommandRegistry& r) {
                     added++;
                 } else {
                     if (nx) continue;
-                    if (existing->second != score) {
-                        auto range = value.zsetByScore.equal_range(existing->second);
-                        for (auto sit = range.first; sit != range.second; ++sit) {
-                            if (sit->second == members[k]) {
-                                value.zsetByScore.erase(sit);
-                                break;
-                            }
+                    if (existing->second != score) updated++;
+                    // Clear the old row whether or not the coordinates moved.
+                    // Skipping this when they matched left a second row for one
+                    // member, and GEOSEARCH walked the index and saw it twice.
+                    auto range = value.zsetByScore.equal_range(existing->second);
+                    for (auto sit = range.first; sit != range.second;) {
+                        if (sit->second == members[k]) {
+                            sit = value.zsetByScore.erase(sit);
+                        } else {
+                            ++sit;
                         }
-                        updated++;
                     }
                 }
                 value.zsetScores[members[k]] = score;
@@ -111,15 +113,20 @@ void registerGeoCommands(CommandRegistry& r) {
     };
 
     r["GEOPOS"] = [](CommandContext& ctx) {
+        // GEOPOS key member [member ...]. A key with no members is legal and
+        // answers with an empty array; `GEOPOS` on its own is not.
         if (ctx.size() < 2) return wrongArity("geopos");
         return ctx.services->store->read([&](const DataStore::Map& data) -> std::string {
             auto slot = data.find(ctx[1]);
-            if (slot == data.end()) return resp::nullArray();
-            if (slot->second.type != DataType::ZSET) return resp::error(kGeoIndexTypeError);
+            const bool live = slot != data.end() && !slot->second.isExpired(timeutil::nowMs());
+            if (live && slot->second.type != DataType::ZSET) return resp::error(kGeoIndexTypeError);
+            // A key that is not there is not a short answer and not an error:
+            // Redis still answers once per member asked for, with a null each
+            // time, so the reply length always matches the request.
             std::vector<std::string> out;
             for (size_t i = 2; i < ctx.size(); i++) {
                 double lon = 0, lat = 0;
-                if (!positionOf(slot->second, ctx[i], lon, lat)) {
+                if (!live || !positionOf(slot->second, ctx[i], lon, lat)) {
                     out.push_back(resp::nullArray());
                 } else {
                     out.push_back(resp::array({resp::bulkString(strutil::formatScore(lon)),
