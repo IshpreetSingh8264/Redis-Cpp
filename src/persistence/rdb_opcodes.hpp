@@ -13,9 +13,12 @@ namespace redis::rdb {
 
 /// File header. "REDIS" + a 4-digit version.
 inline constexpr char kMagic[5] = {'R', 'E', 'D', 'I', 'S'};
-/// Version 11 is the last format Redis 7.x emits and every version since 7
-/// reads, so it is the right thing to write.
-inline constexpr uint32_t kVersion = 11;
+/// Version 12 is the format Redis 7.4 emits (RDB_VERSION in src/rdb.h). We
+/// only *write* the type bytes Redis has understood since 2.6, so declaring 12
+/// costs nothing and is what lets a dump produced by a current redis-server be
+/// loaded at all -- a v11 ceiling rejects every 7.4 file outright, expiry
+/// handling included.
+inline constexpr uint32_t kVersion = 12;
 
 /// Structural opcodes.
 enum Opcode : uint8_t {
