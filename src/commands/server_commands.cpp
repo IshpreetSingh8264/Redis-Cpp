@@ -1,9 +1,11 @@
 /**
  * server_commands.cpp -- PING, ECHO, INFO, CONFIG, COMMAND, CLIENT, DEBUG.
  */
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <climits>
 #include <cstdlib>
 #include <sstream>
 
@@ -63,6 +65,36 @@ std::string buildInfo(CommandContext& ctx) {
     return ss.str();
 }
 
+/// `dir` as the absolute path it names.
+///
+/// Redis resolves the working directory when it loads the configuration
+/// (getAbsolutePath in util.c) and never hands a client back the "." that was
+/// on the command line, because a relative `dir` is only meaningful relative to
+/// a working directory the client cannot see. Resolve it the same way: join
+/// onto getcwd(2), then let realpath(3) collapse the "./" and "../" that Redis
+/// normalises away.
+///
+/// Returns an empty string when `path` does not name a directory, which is the
+/// only case with no sensible absolute form. CONFIG SET dir reports that as an
+/// error rather than storing it, exactly as Redis refuses a dir it cannot
+/// chdir into.
+std::string absoluteDir(std::string path) {
+    if (path.empty()) return "";
+    struct stat st;
+    if (path[0] != '/') {
+        char cwd[PATH_MAX];
+        if (getcwd(cwd, sizeof(cwd)) == nullptr) return "";
+        path = std::string(cwd) + "/" + path;
+    }
+    if (stat(path.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) return "";
+    if (char* resolved = realpath(path.c_str(), nullptr)) {
+        const std::string out(resolved);
+        free(resolved);
+        return out;
+    }
+    return path;
+}
+
 /// CONFIG GET returns a flat [name, value, name, value ...] array.
 std::string configGet(CommandContext& ctx, const std::vector<std::string>& params) {
     const ServerConfig& config = *ctx.services->config;
@@ -89,8 +121,23 @@ std::string configGet(CommandContext& ctx, const std::vector<std::string>& param
         add("appendfilename", config.appendfilename);
     }
     if (matches("appenddirname")) add("appenddirname", config.appenddirname);
-    if (matches("dir")) add("dir", config.dir);
+    if (matches("dir")) {
+        // If the directory has been removed out from under the server, the raw
+        // value is still the truthful answer; reporting an empty path would not
+        // be.
+        const std::string resolved = absoluteDir(config.dir);
+        add("dir", resolved.empty() ? config.dir : resolved);
+    }
     if (matches("dbfilename")) add("dbfilename", config.dbfilename);
+    if (matches("appendfsync")) {
+        // This AOF writes every command to the incremental part immediately and
+        // fsyncs on close and on rewrite; it never fsyncs per command, so it is
+        // not `always` and it is not `noappend`. `everysec` is the Redis word
+        // for "the OS decides when the bytes reach the platter", which is what
+        // this is. --appendfsync is not parsed, so it is also the only policy
+        // the server can currently be in.
+        add("appendfsync", "everysec");
+    }
     if (matches("save")) add("save", "3600 1 300 100 60 10000");
     if (matches("port")) add("port", std::to_string(config.port));
     if (matches("requirepass")) {
@@ -147,7 +194,18 @@ void registerServerCommands(CommandRegistry& r) {
                     continue;
                 }
                 if (param == "dir") {
-                    ctx.services->config->dir = ctx[i + 1];
+                    // Store what CONFIG GET will report, so the value the
+                    // server is using and the value a client reads back are the
+                    // same string. Redis goes further and chdir()s; every path
+                    // here is already built from `dir`, so storing the absolute
+                    // form is enough and does not move the process out from
+                    // under the RDB and AOF layers.
+                    const std::string resolved = absoluteDir(ctx[i + 1]);
+                    if (resolved.empty()) {
+                        return resp::error("ERR Can't chdir to '" + ctx[i + 1] +
+                                           "': No such file or directory");
+                    }
+                    ctx.services->config->dir = resolved;
                     continue;
                 }
                 if (param == "dbfilename") {
