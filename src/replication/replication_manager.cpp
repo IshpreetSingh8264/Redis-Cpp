@@ -129,6 +129,14 @@ std::string ReplicationManager::ackFrame() const {
     return resp::encodeCommand({"REPLCONF", "ACK", std::to_string(offset())});
 }
 
+int ReplicationManager::countAcks(int64_t target) const {
+    int acked = 0;
+    for (const auto& entry : replicas_) {
+        if (entry.second.ackedOffset >= target) acked++;
+    }
+    return acked;
+}
+
 int ReplicationManager::waitForReplicas(int numReplicas, int64_t timeoutMs) {
     if (numReplicas <= 0) return 0;
     if (!config_->isReplica && replicas_.empty()) return 0;
@@ -139,32 +147,50 @@ int ReplicationManager::waitForReplicas(int numReplicas, int64_t timeoutMs) {
     const int64_t target = offset();
     const int64_t deadline = timeutil::steadyMs() + timeoutMs;
 
-    for (;;) {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            int acked = 0;
-            for (const auto& [fd, link] : replicas_) {
-                if (link.ackedOffset >= target) acked++;
-            }
-            if (acked >= numReplicas) return std::min(acked, numReplicas);
-            if (timeutil::steadyMs() >= deadline) return acked;
-
-            // Poll rather than sleep the whole timeout: a replica may have
-            // acked in the meantime, and REPLCONF GETACK is how it tells us.
-            for (auto& [fd, link] : replicas_) {
-                io::sendAll(fd, resp::encodeCommand({"REPLCONF", "GETACK", "*"}));
-            }
+    // Ask once, then wait. redis does the same: waitCommand() calls
+    // replicationRequestAckFromSlaves(), which only sets a flag, and
+    // beforeSleep() consumes it with sendGetackToReplicas() and clears it --
+    // one REPLCONF GETACK per event loop iteration in which a client blocked.
+    //
+    // Re-asking on a timer instead fills the link. A replica reads exactly one
+    // GETACK per WAIT and treats the next one as unexpected data in its
+    // replication stream, so a poll loop makes WAIT fail for the very replicas
+    // that were going to ack.
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // numReplicas is the threshold for stopping the wait early, not the
+        // number to report. redis counts *every* online replica that has
+        // acked the target and replies with that total:
+        //
+        //     ackreplicas = replicationCountAcksByOffset(c->woff);
+        //     if (ackreplicas >= numreplicas || c->flags & CLIENT_DENY_BLOCKING) {
+        //         addReplyLongLong(c,ackreplicas);
+        //         return;
+        //     }
+        //
+        // and replicationCountAcksByOffset() counts without a cap. Clamping
+        // the reply to numReplicas makes `WAIT 1 500` answer 1 with three
+        // replicas attached, where redis answers 3.
+        const int already = countAcks(target);
+        if (already >= numReplicas) return already;  // nothing to wait for
+        for (const auto& entry : replicas_) {
+            io::sendAll(entry.first, resp::encodeCommand({"REPLCONF", "GETACK", "*"}));
         }
+    }
+
+    // Block by watching the ack counters. redis can unblock a WAIT from its
+    // event loop; this runs in the middle of command dispatch, so the only way
+    // to wait here is to give up the cpu and look again.
+    for (;;) {
         if (timeutil::steadyMs() >= deadline) break;
         usleep(2000);
+        std::lock_guard<std::mutex> lock(mutex_);
+        const int acked = countAcks(target);
+        if (acked >= numReplicas) return acked;
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
-    int acked = 0;
-    for (const auto& [fd, link] : replicas_) {
-        if (link.ackedOffset >= target) acked++;
-    }
-    return std::min(acked, numReplicas);
+    return countAcks(target);
 }
 
 std::string ReplicationManager::infoReplication() const {
@@ -326,10 +352,13 @@ void ReplicationManager::rdbLoadFromMaster(const std::string& blob) {
     if (!error.empty()) lastError_ = error;  // e.g. a checksum warning
 }
 
-void ReplicationManager::ackCurrentOffset() {
-    // Acknowledge after every applied command rather than on a timer. WAIT
-    // blocks on these, and a timer that swallows the ack after a single write
-    // is what made `WAIT 1 1000` answer 0 on a fully caught-up replica.
+void ReplicationManager::advanceOffset(int64_t bytes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    offset_ += bytes;
+}
+
+void ReplicationManager::sendAck() {
+    if (masterFd_ < 0) return;
     io::sendAll(masterFd_, ackFrame());
 }
 
@@ -479,12 +508,24 @@ void ReplicationManager::stepHandshake() {
             pendingRdb_.clear();
             pendingRdbExpected_ = 0;
             state_ = HandshakeState::STREAMING;
-            ackCurrentOffset();
+            // No ack here. A replica speaks only when the master asks with
+            // REPLCONF GETACK *, and real redis does not volunteer one after a
+            // full resync either. An unasked-for REPLCONF ACK is worse than
+            // useless: on the wire it is indistinguishable from the answer the
+            // master is waiting for, so every ack the master reads is shifted
+            // by one.
             break;
         }
     }
 
     if (state_ == HandshakeState::STREAMING) streamCommands();
+}
+
+/// True for the master's `REPLCONF GETACK *`, which is a request for an ack
+/// rather than part of the replicated command stream.
+static bool isGetAckRequest(const std::vector<std::string>& args) {
+    if (args.size() < 2) return false;
+    return strutil::toUpper(args[0]) == "REPLCONF" && strutil::toUpper(args[1]) == "GETACK";
 }
 
 void ReplicationManager::streamCommands() {
@@ -500,17 +541,31 @@ void ReplicationManager::streamCommands() {
         if (r.consumed == 0) break;
         inbound_.erase(0, r.consumed);
 
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            offset_ += static_cast<int64_t>(r.consumed);
+        if (isGetAckRequest(r.args)) {
+            // Answer with the offset applied *so far*, then count this frame.
+            //
+            // The order is the whole point, and it is what redis does:
+            // replconfCommand() calls replicationSendAck() while handling the
+            // command, and that reports c->reploff, which networking.c only
+            // refreshes afterwards, in commandProcessed(). So the reply is
+            // always the value from before the REPLCONF GETACK was consumed --
+            // and the GETACK's own bytes do count towards the offset, they are
+            // just not in the number it reports.
+            //
+            // Reporting the post-frame offset instead is what stage-115 caught:
+            // after a PING the master expected REPLCONF ACK 51 and got 37.
+            sendAck();
+            advanceOffset(static_cast<int64_t>(r.consumed));
+            continue;
         }
+
+        advanceOffset(static_cast<int64_t>(r.consumed));
 
         if (r.args.empty()) continue;
         const std::string name = strutil::toUpper(r.args[0]);
         if (name == "PING" || name == "REPLCONF") continue;  // keepalives
         if (applyFromMaster) applyFromMaster(r.args);
     }
-    ackCurrentOffset();
 }
 
 }  // namespace redis

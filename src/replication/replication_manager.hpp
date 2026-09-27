@@ -129,7 +129,9 @@ private:
     void fail(const std::string& reason);
     void stepHandshake();
     void streamCommands();
-    void ackCurrentOffset();
+    int countAcks(int64_t target) const;
+    void advanceOffset(int64_t bytes);
+    void sendAck();
     void rdbLoadFromMaster(const std::string& blob);
 
     ServerConfig* config_;
@@ -148,7 +150,6 @@ private:
     std::string pendingRdb_;       // partial RDB payload
     size_t pendingRdbExpected_ = 0;
     std::string lastError_;
-    int64_t lastAckSentAt_ = 0;
 };
 
 }  // namespace redis
