@@ -1,12 +1,14 @@
 /**
  * auth_commands.cpp -- AUTH and the ACL subcommands this build answers.
  *
- * The command *categories* of ACL (what a user may run) are not modelled,
- * because without a per-command permission table they would be a field nobody
- * reads. Everything that is answered here is real state: who exists, what
- * passwords they have, which flags they carry, and whether a connection has
- * proved itself.
+ * What a user may *run* is not modelled: there is no per-command permission
+ * table to apply one to. This build grants every authenticated user every
+ * command on every key and channel, so that is what ACL GETUSER reports, and
+ * reporting it is a statement about the server rather than a placeholder.
+ * Everything else answered here is real state: who exists, what passwords they
+ * have, which flags they carry, and whether a connection has proved itself.
  */
+#include "auth/sha256.hpp"
 #include "commands/auth_manager.hpp"
 #include "protocol/resp.hpp"
 #include "types/handler.hpp"
@@ -17,33 +19,41 @@ namespace redis {
 
 namespace {
 
-/// ACL GETUSER's reply: a flat array of key/value bulk strings.
+/// ACL GETUSER's reply: a flat array of alternating field names and values, in
+/// the order and the RESP types Redis uses.
+///
+/// The types are the part that is easy to get wrong and impossible to be lenient
+/// about. `flags` and `passwords` are arrays; a comma-joined string where an
+/// array belongs, or a bare count where the *contents* belong, is a different
+/// protocol, not a variant -- redis-cli and every client library index into
+/// element 1 and expect a list. Passwords are reported as hex SHA-256 digests,
+/// which is what a client compares against and the only form that does not put
+/// the secret on the wire.
 std::string userDescription(const AuthManager& auth, const std::string& name) {
-    std::vector<std::string> out;
-    out.push_back(resp::bulkString("flags"));
     const std::set<std::string> flags = auth.flagsOf(name);
-    std::string joined;
-    for (const auto& f : flags) {
-        if (!joined.empty()) joined += ",";
-        joined += f;
-    }
-    out.push_back(resp::bulkString(joined));
 
     std::vector<std::string> passwords;
     auth.passwordsOf(name, passwords);
-    out.push_back(resp::bulkString("passwords"));
-    out.push_back(resp::integer(static_cast<int64_t>(passwords.size())));
+    std::vector<std::string> hashes;
+    hashes.reserve(passwords.size());
+    // The `redis::` prefix is load-bearing: the parameter below is called
+    // `auth`, which would otherwise shadow the namespace.
+    for (const auto& password : passwords) hashes.push_back(redis::auth::sha256Hex(password));
 
-    // A user with no passwords must authenticate with an empty string; say so
-    // rather than leaving the reader to guess.
-    if (auth.hasNoPasswords(name)) {
-        out.push_back(resp::bulkString("nopass"));
-        out.push_back(resp::boolean(auth.nopass(name)));
-    }
-
-    out.push_back(resp::bulkString("commands"));
-    out.push_back(resp::bulkString("+@all"));
-    return resp::array(out);
+    return resp::array({
+        resp::bulkString("flags"),
+        resp::arrayOfBulkStrings({flags.begin(), flags.end()}),
+        resp::bulkString("passwords"),
+        resp::arrayOfBulkStrings(hashes),
+        resp::bulkString("commands"),
+        resp::bulkString("+@all"),
+        resp::bulkString("keys"),
+        resp::bulkString("~*"),
+        resp::bulkString("channels"),
+        resp::bulkString("&*"),
+        resp::bulkString("selectors"),
+        resp::emptyArray(),
+    });
 }
 
 /// One ACL LIST line per user, built from that user's real flags and password
@@ -140,10 +150,11 @@ void registerAuthCommands(CommandRegistry& r) {
                            rule == "sanitize-payload") {
                     ctx.services->auth->setFlag(name, rule, rule != "off");
                 }
-                // Key patterns (~foo) and channel patterns (&foo) and command
-                // rules (+@read) are accepted and ignored: this build has no
-                // per-command permission table to apply them to, and claiming
-                // otherwise would be a lie the caller can detect.
+                // Key patterns (~foo), channel patterns (&foo) and command
+                // rules (+@read) are accepted and not stored: there is no
+                // permission table here to narrow the all-access default that
+                // ACL GETUSER reports, so keeping them would mean reporting
+                // back a restriction the server does not actually apply.
             }
             return resp::simpleString("OK");
         }
